@@ -102,6 +102,9 @@ class LiveReplayScenario:
         # pseudo controller IS still spawned for them so their tracks are owned
         # at load — vNAS hands the seat to the trainee when they connect.
         self.trainee_positions = set(atc.get("traineePositionIds") or [])
+        # The scenario's designated student position (the trainee seat the human
+        # signs into). vNAS field "studentPositionId". First trainee seat.
+        self.student_position_id = next(iter(atc.get("traineePositionIds") or []), None)
         # Owner keys ("FAC/SEC") whose mapped position is a trainee seat — used to
         # detect which captured handoffs go TO the trainee (→ flash to student).
         self.trainee_owner_keys = {

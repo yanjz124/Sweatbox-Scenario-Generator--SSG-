@@ -295,7 +295,7 @@ async function injectSuccessToast(win: BrowserWindow, message: string): Promise<
 }
 
 export async function uploadScenario(scenarioContents: string): Promise<VNASUploadResult> {
-  let incoming: { aircraft?: unknown; atc?: unknown } & Record<string, unknown>;
+  let incoming: { aircraft?: unknown; atc?: unknown; studentPositionId?: unknown } & Record<string, unknown>;
   try {
     incoming = JSON.parse(scenarioContents);
   } catch (e) {
@@ -326,6 +326,10 @@ export async function uploadScenario(scenarioContents: string): Promise<VNASUplo
       // empty, so we leave the target's existing atc[] untouched.
       if (Array.isArray(incoming.atc) && incoming.atc.length > 0) {
         parsed.atc = incoming.atc;
+      }
+      // Designate the student (trainee) position so handoffs to it resolve.
+      if (incoming.studentPositionId) {
+        parsed.studentPositionId = incoming.studentPositionId;
       }
       payload = parsed;
     } catch {

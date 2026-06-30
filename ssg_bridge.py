@@ -318,6 +318,7 @@ from utils.data_pipeline import to_icao  # noqa: E402,F401
 # can include per-type generation stats in the JSON response.
 _LAST_GENERATION_STATS = None  # Optional[dict]
 _LAST_ATC_ROSTER = None  # Optional[list] — pseudo-ATC roster for live_replay
+_LAST_STUDENT_POS = None  # Optional[str] — studentPositionId for live_replay
 
 
 def dispatch(cfg):
@@ -338,6 +339,7 @@ def dispatch(cfg):
         # Pseudo-ATC roster: controllers that staff the positions aircraft are
         # auto-tracked to (so tracks are owned at load + handoffs flash).
         globals()['_LAST_ATC_ROSTER'] = getattr(sc, 'atc_roster', None) or []
+        globals()['_LAST_STUDENT_POS'] = getattr(sc, 'student_position_id', None)
         # Return the ARTCC facility as the identifier so the exporter uses the
         # enroute (artccId) path rather than an airport code.
         return aircraft, sc.facility
@@ -1085,6 +1087,7 @@ def main(config_path):
         cfg.get('scenarioName') or cfg['scenarioType'],
         str(out_dir),
         atc=_LAST_ATC_ROSTER,
+        student_position_id=_LAST_STUDENT_POS,
     )
     logger.info(f"Generated {len(aircraft)} aircraft -> {filename}")
     response = {

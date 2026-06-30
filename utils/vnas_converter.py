@@ -312,7 +312,8 @@ class VNASConverter:
         distance_nm = max(1, int(altitude_agl / 300))
         return distance_nm
 
-    def create_vnas_scenario(self, aircraft_list: List[Aircraft], atc: List[Dict] = None) -> Dict:
+    def create_vnas_scenario(self, aircraft_list: List[Aircraft], atc: List[Dict] = None,
+                             student_position_id: str = None) -> Dict:
         """
         Create a complete vNAS scenario JSON from a list of Aircraft
 
@@ -340,6 +341,7 @@ class VNASConverter:
             "aircraftGenerators": [],
             "aircraft": vnas_aircraft,
             "atc": atc or [],
+            "studentPositionId": student_position_id,
             "primaryAirportId": airport_code,
             "autoDeleteMode": "None",
             "flightStripConfigurations": []

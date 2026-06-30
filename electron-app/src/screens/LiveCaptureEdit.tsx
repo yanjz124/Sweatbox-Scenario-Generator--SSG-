@@ -271,7 +271,16 @@ export function LiveCaptureEdit() {
     touchesOurAirspace(a) && (ownerSel.size === 0 || ownerSel.has(ownerKey(a)));
   const applyKeep = (pct: number) => {
     setKeepPct(pct);
-    setCap(c => (c ? { ...c, aircraft: c.aircraft.map(a => ({ ...a, include: eligibleForKeep(a) && hashUnit(a.gufi) < pct / 100 })) } : c));
+    setCap(c => {
+      if (!c) return c;
+      // Rank-based: keep exactly pct% of the eligible set (ordered by a stable
+      // hash). Distribution-independent and monotonic — a plain hash<pct/100
+      // threshold skews because the hash isn't perfectly uniform.
+      const eligible = c.aircraft.filter(eligibleForKeep).sort((a, b) => hashUnit(a.gufi) - hashUnit(b.gufi));
+      const cutoff = Math.round((eligible.length * pct) / 100);
+      const keep = new Set(eligible.slice(0, cutoff).map(a => a.gufi));
+      return { ...c, aircraft: c.aircraft.map(a => ({ ...a, include: keep.has(a.gufi) })) };
+    });
   };
   const eligibleCount = aircraft.filter(eligibleForKeep).length;
 

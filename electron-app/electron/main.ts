@@ -74,9 +74,16 @@ async function downloadAndInstallUpdate(
   onProgress: (fraction: number) => void,
 ): Promise<{ ok: boolean; error?: string }> {
   try {
+    // Re-resolve the latest installer URL right now (the passed one can be stale
+    // if a release was deleted/replaced after the update check → 404).
+    let fresh = url;
+    try {
+      const info = await checkForUpdates();
+      if (info.downloadUrl) fresh = info.downloadUrl;
+    } catch { /* fall back to the passed url */ }
     const dest = path.join(app.getPath('temp'), `SSG-Setup-${Date.now()}.exe`);
-    const res = await fetch(url);
-    if (!res.ok || !res.body) return { ok: false, error: `download failed (${res.status})` };
+    const res = await fetch(fresh);
+    if (!res.ok || !res.body) return { ok: false, error: `download failed (${res.status}) from ${fresh}` };
     const total = Number(res.headers.get('content-length')) || 0;
     const out = createWriteStream(dest);
     let received = 0;
