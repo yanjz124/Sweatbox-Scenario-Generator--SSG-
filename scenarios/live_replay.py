@@ -45,6 +45,33 @@ def _norm_sec(s) -> str:
     return t or "0"
 
 
+_CROCKFORD = "0123456789ABCDEFGHJKMNPQRSTVWXYZ"
+
+
+def _ulid() -> str:
+    """Generate a ULID-shaped 26-char Crockford-base32 id (vNAS entity id)."""
+    import os
+    import time
+    ts = int(time.time() * 1000) & ((1 << 48) - 1)
+    head = ""
+    for _ in range(10):
+        head = _CROCKFORD[ts & 31] + head
+        ts >>= 5
+    tail = "".join(_CROCKFORD[b & 31] for b in os.urandom(16))[:16]
+    return head + tail
+
+
+def _icao_airport(code) -> str:
+    """Coerce a flight-plan endpoint to a vNAS-acceptable ICAO airport (exactly
+    four letters). 3-letter US codes get a 'K' prefix; anything with digits or
+    the wrong length (FAA LIDs like 60J/4B6, fixes, DMEs) is dropped to '' —
+    data-admin refuses to save a scenario containing a non-airport endpoint."""
+    c = (code or "").strip().upper()
+    if len(c) == 3 and c.isalpha():
+        c = "K" + c
+    return c if (len(c) == 4 and c.isalpha()) else ""
+
+
 class LiveReplayScenario:
     """Build aircraft from a captured sector snapshot."""
 
@@ -62,14 +89,43 @@ class LiveReplayScenario:
         # fallback. Keys normalized so 7 == 07.
         atc = self.capture.get("atcConfig") or {}
         self.atc_enabled = bool(atc.get("enabled"))
-        self.sector_to_position = {
-            _norm_sec(k): v for k, v in (atc.get("sectorToPosition") or {}).items() if v
+        # Keyed by ownership identity FACILITY/SECTOR (uppercased) — a bare
+        # sector isn't unique across the facility, neighbor ARTCCs, and TRACONs.
+        self.owner_to_position = {
+            str(k).upper(): v for k, v in (atc.get("sectorToPosition") or {}).items() if v
         }
         self.fallback_position = atc.get("fallbackPositionId") or None
         self.atc_handoff_from_timeline = bool(atc.get("handoffFromTimeline"))
         # Positions the trainee works: aircraft owned by these keep ownership but
-        # get NO auto-handoff (the trainee does their own in/out handoffs).
+        # get NO auto-handoff (the trainee does their own in/out handoffs). A
+        # pseudo controller IS still spawned for them so their tracks are owned
+        # at load — vNAS hands the seat to the trainee when they connect.
         self.trainee_positions = set(atc.get("traineePositionIds") or [])
+        # positionId -> {facilityId, artccId} metadata from the editor (facility
+        # differs for center / TRACON / neighbor-ARTCC positions). The roster
+        # itself is derived from the ACTUAL aircraft assignments in generate(),
+        # so the fallback (and any combined/trainee position) is always staffed.
+        self._atc_meta = {
+            e.get("positionId"): e
+            for e in (atc.get("atcEntries") or []) if e.get("positionId")
+        }
+        self.atc_roster: List[Dict] = []
+
+    def _build_atc_roster(self, position_ids) -> List[Dict]:
+        """One auto-connecting pseudo controller per position that actually owns
+        a track (fallback + trainee included), so nothing loads unowned."""
+        roster: List[Dict] = []
+        for pid in dict.fromkeys(p for p in position_ids if p):  # dedupe, ordered
+            meta = self._atc_meta.get(pid) or {}
+            roster.append({
+                "id": _ulid(),
+                "artccId": meta.get("artccId") or self.facility,
+                "facilityId": meta.get("facilityId") or meta.get("artccId") or self.facility,
+                "positionId": pid,
+                "autoConnect": True,
+                "autoTrackAirportIds": [],
+            })
+        return roster
 
     @classmethod
     def from_file(cls, path: str | Path, **kwargs) -> "LiveReplayScenario":
@@ -88,6 +144,14 @@ class LiveReplayScenario:
                 aircraft.append(ac)
             elif reason in skipped:
                 skipped[reason] += 1
+
+        # Staff every position an aircraft is actually auto-tracked to — this
+        # guarantees the fallback and trainee positions get a controller, so no
+        # track loads as "Position not found".
+        if self.atc_enabled:
+            self.atc_roster = self._build_atc_roster(
+                a.auto_track_position_id for a in aircraft if getattr(a, "auto_track_position_id", None)
+            )
 
         self.generation_stats = {
             "requested_total": len(entries),
@@ -131,7 +195,10 @@ class LiveReplayScenario:
         if not frd:
             return None, "no_frd"
 
-        destination = fp.get("destination") or ""
+        # vNAS / data-admin requires dep & dest to be real ICAO airports — drop
+        # FAA LIDs / fixes / DMEs to '' (they block the whole scenario save).
+        departure = _icao_airport(fp.get("departure"))
+        destination = _icao_airport(fp.get("destination"))
         nav_path = self._downstream_route(route_coords, lat, lon, destination)
 
         # Never fake the aircraft type — skip if SWIM hadn't published it yet
@@ -141,10 +208,11 @@ class LiveReplayScenario:
             return None, "no_type"
         aircraft_type = self._with_equipment_suffix(type_raw)
 
-        # Spawn at the FILED flight-plan altitude (cruise), not the live/current
-        # altitude — so aircraft appear at cruise, not mid-climb.
+        # Spawn at the aircraft's ACTUAL (reported) altitude so the climb/descent
+        # profile replays — onAltitudeProfile + any captured altitude clearance
+        # flies it to its assigned/cruise level. Fall back to filed cruise.
         fp_alt = _to_int(fp.get("cruiseAltitudeFt")) or _to_int(fp.get("assignedAltitudeFt"))
-        spawn_alt = fp_alt or _to_int(spawn.get("altitudeFt")) or 35000
+        spawn_alt = _to_int(spawn.get("altitudeFt")) or fp_alt or 35000
         cruise_alt = fp_alt or spawn_alt
 
         ground_speed = _to_int(spawn.get("groundSpeedKt")) or 0
@@ -169,7 +237,7 @@ class LiveReplayScenario:
             ground_speed=ground_speed,
             starting_conditions_type="FixOrFrd",
             fix=frd,
-            departure=fp.get("departure") or "",
+            departure=departure,
             arrival=destination,
             route=route_str,
             # Only fixes AHEAD of the aircraft (or the destination). Never fall
@@ -189,20 +257,96 @@ class LiveReplayScenario:
         # Fake ATC: bind the aircraft to its sector's vNAS position (combine /
         # fallback applied). The converter emits autoTrackConditions from this.
         if self.atc_enabled:
-            sec = (entry.get("entry") or {}).get("controllingSector") or ""
-            posid = self.sector_to_position.get(_norm_sec(sec)) or self.fallback_position
+            ent = entry.get("entry") or {}
+            okey = f"{(ent.get('controllingFacility') or '').upper()}/{(ent.get('controllingSector') or '').upper()}"
+            posid = self.owner_to_position.get(okey) or self.fallback_position
             if posid:
                 aircraft.auto_track_position_id = posid
+                is_trainee = posid in self.trainee_positions
                 # Auto-handoff timing from the captured timeline — but NOT for
                 # the trainee's own positions (they handle their handoffs).
-                if self.atc_handoff_from_timeline and posid not in self.trainee_positions:
+                if self.atc_handoff_from_timeline and not is_trainee:
                     hos = entry.get("handoffs") or []
                     if hos and hos[0].get("atOffsetSec") is not None:
                         delay = int(hos[0]["atOffsetSec"]) - int(entry.get("firstSeenOffsetSec") or 0)
                         if delay > 0:
                             aircraft.auto_track_handoff_delay = delay
+                # Re-issue the captured controller instructions via the fake ATC
+                # so the AI pilots execute them — but NEVER for the trainee's own
+                # sector (the trainee gives those clearances themselves).
+                if not is_trainee:
+                    cmds, scratch = self._clearance_commands(
+                        entry.get("clearances") or {}, cruise_alt,
+                        on_arrival=bool((fp.get("star") or "").strip()),
+                    )
+                    if cmds:
+                        aircraft.preset_commands = cmds
+                    if scratch:
+                        aircraft.auto_track_scratchpad = scratch
 
         return aircraft, None
+
+    # ── captured-clearance replay ───────────────────────────────────────────────
+    def _clearance_commands(self, clr: Dict, cruise_alt, on_arrival: bool = False) -> tuple:
+        """Translate a captured ERAM 4th-line / datablock clearance into vNAS
+        sweatbox commands the AI pilot executes (DVIA/CM/SPD/MACH/FH) + a
+        scratchpad."""
+        import re
+        cmds: List[str] = []
+
+        # Altitude. Arrivals on a STAR get DVIA (descend via the arrival, honoring
+        # its crossing restrictions), optionally bottoming at the assigned/interim
+        # altitude. Everyone else gets a plain CM to a captured interim level-off.
+        interim = _to_int(clr.get("interimAltitudeFt"))
+        assigned = _to_int(clr.get("assignedAltitudeFt"))
+        if on_arrival:
+            target = interim or assigned
+            cmds.append(f"DVIA {self._alt_token(target)}" if target else "DVIA")
+        elif interim and interim != (cruise_alt or 0):
+            cmds.append(f"CM {self._alt_token(interim)}")
+
+        # Speed vs Mach (SWIM gives e.g. "250", "S250", "M81", ".79").
+        sp = self._speed_command(clr.get("speed"))
+        if sp:
+            cmds.append(sp)
+
+        # Assigned heading (vector) — e.g. "020", "H020".
+        hdg = self._heading_token(clr.get("heading"))
+        if hdg:
+            cmds.append(f"FH {hdg}")
+
+        scratch = (clr.get("fourthLine") or clr.get("text") or "")
+        scratch = re.sub(r"\s+", " ", str(scratch)).strip() or None
+        return cmds, scratch
+
+    @staticmethod
+    def _alt_token(alt_ft: int) -> str:
+        """vNAS altitude token: flight levels as hundreds (FL240→'240'),
+        low altitudes as feet ('5000')."""
+        return str(alt_ft // 100) if alt_ft >= 18000 else str(alt_ft)
+
+    @staticmethod
+    def _speed_command(raw) -> Optional[str]:
+        import re
+        s = str(raw or "").upper().strip()
+        if not s:
+            return None
+        digits = re.sub(r"\D", "", s)
+        if not digits:
+            return None
+        n = int(digits)
+        # Mach if flagged with M/'.', or a bare 2-digit value (.74 == "74").
+        if "M" in s or s.startswith(".") or n < 100:
+            return f"MACH {n}"
+        return f"SPD {n}"
+
+    @staticmethod
+    def _heading_token(raw) -> Optional[str]:
+        import re
+        digits = re.sub(r"\D", "", str(raw or ""))
+        if not digits:
+            return None
+        return f"{int(digits) % 360:03d}"
 
     # ── helpers ─────────────────────────────────────────────────────────────────
     @staticmethod

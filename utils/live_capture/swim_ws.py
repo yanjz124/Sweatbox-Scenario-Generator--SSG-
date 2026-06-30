@@ -84,7 +84,18 @@ class CapturedAircraft:
     star: Optional[str] = None
     cruise_altitude_ft: Optional[int] = None
     assigned_altitude_ft: Optional[int] = None
+    interim_altitude_ft: Optional[int] = None
+    block_floor_ft: Optional[int] = None
+    block_ceiling_ft: Optional[int] = None
     cruise_speed_kt: Optional[int] = None
+    # Controller-issued instructions (ERAM 4th-line / datablock), so the replay
+    # can have the fake ATC re-issue them and the AI pilots execute.
+    clearance_heading: Optional[str] = None
+    clearance_speed: Optional[str] = None
+    clearance_text: Optional[str] = None
+    fourth_line: Optional[str] = None
+    pointout_from: Optional[str] = None
+    pointout_to: Optional[str] = None
     remarks: Optional[str] = None
     equipment: Optional[str] = None
     # entry context (for debugging / fidelity)
@@ -124,7 +135,16 @@ class CapturedAircraft:
             star=flight.get("star"),
             cruise_altitude_ft=_int(cruise_alt),
             assigned_altitude_ft=_int(assigned),
+            interim_altitude_ft=_int(_num(flight.get("interimAltitude"))),
+            block_floor_ft=_int(_num(flight.get("blockFloor"))),
+            block_ceiling_ft=_int(_num(flight.get("blockCeiling"))),
             cruise_speed_kt=_int(spd),
+            clearance_heading=(flight.get("clearanceHeading") or None),
+            clearance_speed=(flight.get("clearanceSpeed") or None),
+            clearance_text=(flight.get("clearanceText") or None),
+            fourth_line=(flight.get("fourthAdaptedField") or None),
+            pointout_from=(flight.get("pointoutOriginatingUnit") or None),
+            pointout_to=(flight.get("pointoutReceivingUnit") or None),
             remarks=flight.get("remarks"),
             equipment=flight.get("equipmentQualifier"),
             controlling_facility=flight.get("controllingFacility"),
@@ -394,6 +414,20 @@ class CaptureResult:
                         "controllingFacility": a.controlling_facility,
                         "controllingSector": a.controlling_sector,
                     },
+                    # Controller-issued instructions observed (ERAM 4th-line /
+                    # datablock) — for the replay to re-issue via the fake ATC.
+                    "clearances": {
+                        "interimAltitudeFt": a.interim_altitude_ft,
+                        "assignedAltitudeFt": a.assigned_altitude_ft,
+                        "blockFloorFt": a.block_floor_ft,
+                        "blockCeilingFt": a.block_ceiling_ft,
+                        "heading": a.clearance_heading,
+                        "speed": a.clearance_speed,
+                        "text": a.clearance_text,
+                        "fourthLine": a.fourth_line,
+                        "pointoutFrom": a.pointout_from,
+                        "pointoutTo": a.pointout_to,
+                    },
                     "handoffs": a.handoffs,
                 }
                 for a in sorted(self.aircraft, key=lambda x: x.first_seen_offset_sec)
@@ -430,10 +464,13 @@ class SwimCaptureClient:
     def capture(self, window_sec: int,
                 progress_callback: Optional[Callable[[float, int, int, int], None]] = None,
                 stop_event: Optional[threading.Event] = None,
-                recv_timeout: float = 1.0) -> CaptureResult:
+                recv_timeout: float = 1.0,
+                autosave_path=None) -> CaptureResult:
         """Capture for ``window_sec`` seconds. ``progress_callback`` receives
         (elapsed_sec, window_sec, n_recorded, n_active_sectors) roughly once per
-        second. ``stop_event`` lets a GUI cancel early."""
+        second. ``stop_event`` lets a GUI cancel early. ``autosave_path`` (if set)
+        gets the partial capture written every ~10s so a crash/disconnect never
+        loses data."""
         try:
             import websocket  # websocket-client
         except ImportError as e:
@@ -455,6 +492,29 @@ class SwimCaptureClient:
         capture_start = time.monotonic()
         capture_start_iso = datetime.now(timezone.utc).isoformat()
         last_progress = 0.0
+        last_save = 0.0
+
+        def build_result() -> CaptureResult:
+            diagnostics = {
+                "recorded": len(session.recorded),
+                "skippedNoRoute": session.skipped_no_route,
+                "skippedNoPosition": session.skipped_no_position,
+                "activeSectorCount": len(session.facility_sectors_seen),
+                "activeSectors": sorted(session.facility_sectors_seen),
+                "recordedBySector": dict(
+                    sorted(session.recorded_by_sector.items(), key=lambda kv: kv[1], reverse=True)
+                ),
+                "seenSectorsTop": dict(
+                    sorted(session.seen_sectors.items(), key=lambda kv: kv[1], reverse=True)[:15]
+                ),
+            }
+            return CaptureResult(
+                facility=self.facility, sector=self.sector,
+                capture_start_iso=capture_start_iso, window_sec=window_sec,
+                aircraft=list(session.recorded.values()),
+                boundary_kml=self.boundary_kml_name, diagnostics=diagnostics,
+            )
+
         try:
             while True:
                 elapsed = time.monotonic() - capture_start
@@ -486,39 +546,29 @@ class SwimCaptureClient:
                         elapsed, window_sec, len(session.recorded),
                         len(session.facility_sectors_seen),
                     )
+
+                # Incremental autosave so a crash/disconnect never loses data.
+                if autosave_path and (elapsed - last_save) >= 10.0:
+                    last_save = elapsed
+                    try:
+                        build_result().write(autosave_path)
+                    except Exception as e:  # noqa: BLE001
+                        logger.warning(f"capture autosave failed: {e}")
         finally:
             try:
                 ws.close()
             except Exception:  # noqa: BLE001
                 pass
 
-        diagnostics = {
-            "recorded": len(session.recorded),
-            "skippedNoRoute": session.skipped_no_route,
-            "skippedNoPosition": session.skipped_no_position,
-            # Active sectors = sectors in this facility that owned ≥1 flight.
-            "activeSectorCount": len(session.facility_sectors_seen),
-            "activeSectors": sorted(session.facility_sectors_seen),
-            "recordedBySector": dict(
-                sorted(session.recorded_by_sector.items(), key=lambda kv: kv[1], reverse=True)
-            ),
-            # Top sectors observed (any facility) — verify id format if needed.
-            "seenSectorsTop": dict(
-                sorted(session.seen_sectors.items(), key=lambda kv: kv[1], reverse=True)[:15]
-            ),
-        }
+        result = build_result()
         if not session.recorded:
             logger.warning(
                 f"Capture recorded 0 aircraft for {self.facility}/{self.sector}. "
-                f"Observed sectors: {diagnostics['seenSectorsTop']}"
+                f"Observed sectors: {result.diagnostics['seenSectorsTop']}"
             )
-
-        return CaptureResult(
-            facility=self.facility,
-            sector=self.sector,
-            capture_start_iso=capture_start_iso,
-            window_sec=window_sec,
-            aircraft=list(session.recorded.values()),
-            boundary_kml=self.boundary_kml_name,
-            diagnostics=diagnostics,
-        )
+        if autosave_path:
+            try:
+                result.write(autosave_path)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(f"capture final autosave failed: {e}")
+        return result

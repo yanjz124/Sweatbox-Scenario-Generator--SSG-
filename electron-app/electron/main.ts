@@ -3,8 +3,8 @@ import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { generateScenario } from './ipc/scenario';
 import { listAirports } from './ipc/airports';
-import { uploadScenario, resetVnasSession, clearVnasCookies } from './ipc/vnas';
-import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors } from './ipc/liveCapture';
+import { uploadScenario, resetVnasSession, clearVnasCookies, dumpScenario } from './ipc/vnas';
+import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors, killCapture } from './ipc/liveCapture';
 import type {
   ScenarioConfig,
   SwimCredentialsInput,
@@ -183,6 +183,35 @@ function registerIpc() {
   ipcMain.handle('liveCapture:getRouteSectors', (_e, facility: string, captureFile: string) =>
     getRouteSectors(facility, captureFile),
   );
+  ipcMain.handle('liveCapture:listCaptures', async () => {
+    const dir = path.join(app.getPath('userData'), 'captures');
+    try {
+      const files = (await fs.readdir(dir)).filter(f => f.endsWith('.capture.json'));
+      const out = [];
+      for (const f of files) {
+        const p = path.join(dir, f);
+        try {
+          const st = await fs.stat(p);
+          const j = JSON.parse(await fs.readFile(p, 'utf8'));
+          out.push({
+            path: p,
+            filename: f,
+            facility: j.facility ?? '',
+            sector: j.sector ?? '',
+            aircraftCount: Array.isArray(j.aircraft) ? j.aircraft.length : 0,
+            captureStart: j.captureStart ?? '',
+            mtimeMs: st.mtimeMs,
+          });
+        } catch {
+          /* skip unreadable file */
+        }
+      }
+      out.sort((a, b) => b.mtimeMs - a.mtimeMs);
+      return out;
+    } catch {
+      return [];
+    }
+  });
   ipcMain.handle('liveCapture:readCapture', async (_e, filePath: string) => {
     try {
       return JSON.parse(await fs.readFile(filePath, 'utf8'));
@@ -197,6 +226,20 @@ function registerIpc() {
     await fs.writeFile(out, JSON.stringify(data, null, 2), 'utf8');
     return out;
   });
+  ipcMain.handle('liveCapture:deleteCapture', async (_e, filePath: string) => {
+    // Only allow deleting files inside the app's captures dir.
+    const dir = path.join(app.getPath('userData'), 'captures');
+    const resolved = path.resolve(filePath);
+    if (path.dirname(resolved) !== path.resolve(dir)) {
+      return { ok: false, message: 'refused: outside captures directory' };
+    }
+    try {
+      await fs.unlink(resolved);
+      return { ok: true };
+    } catch (e) {
+      return { ok: false, message: String(e) };
+    }
+  });
   ipcMain.handle('liveCapture:stopCapture', () => stopCapture());
   ipcMain.handle('liveCapture:startCapture', (e, req: CaptureRequest) =>
     startCapture(req, progress => {
@@ -206,6 +249,7 @@ function registerIpc() {
     }),
   );
   ipcMain.handle('vnas:upload', (_e, contents: string) => uploadScenario(contents));
+  ipcMain.handle('vnas:dump', (_e, outPath: string) => dumpScenario(outPath));
   ipcMain.handle('vnas:reset', () => resetVnasSession());
   ipcMain.handle('vnas:clearCookies', () => clearVnasCookies());
   ipcMain.handle('app:checkForUpdates', () => checkForUpdates());
@@ -221,6 +265,9 @@ app.whenReady().then(() => {
 });
 
 app.on('before-quit', () => {
+  // Kill any running capture child first so it isn't orphaned (orphans keep
+  // streaming progress and double up the next run).
+  killCapture();
   // Best-effort: stop the warm SwimServer so it doesn't linger after SSG exits.
   disconnect().catch(() => {});
 });

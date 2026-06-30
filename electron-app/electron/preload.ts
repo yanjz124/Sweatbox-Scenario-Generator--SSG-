@@ -50,8 +50,10 @@ contextBridge.exposeInMainWorld('ssg', {
     getPositions: (facility: string) => ipcRenderer.invoke('liveCapture:getPositions', facility),
     getRouteSectors: (facility: string, captureFile: string) =>
       ipcRenderer.invoke('liveCapture:getRouteSectors', facility, captureFile),
+    listCaptures: () => ipcRenderer.invoke('liveCapture:listCaptures'),
     readCapture: (filePath: string) => ipcRenderer.invoke('liveCapture:readCapture', filePath),
     writeCapture: (data: unknown) => ipcRenderer.invoke('liveCapture:writeCapture', data),
+    deleteCapture: (filePath: string) => ipcRenderer.invoke('liveCapture:deleteCapture', filePath),
     startCapture: (req: CaptureRequest): Promise<CaptureResult> =>
       ipcRenderer.invoke('liveCapture:startCapture', req),
     stopCapture: (): Promise<{ stopped: boolean }> =>
@@ -73,6 +75,8 @@ contextBridge.exposeInMainWorld('ssg', {
   vnas: {
     upload: (scenarioContents: string): Promise<VNASUploadResult> =>
       ipcRenderer.invoke('vnas:upload', scenarioContents),
+    dump: (outPath: string): Promise<{ ok: boolean; message: string }> =>
+      ipcRenderer.invoke('vnas:dump', outPath),
     reset: (): Promise<void> => ipcRenderer.invoke('vnas:reset'),
     clearCookies: (): Promise<void> => ipcRenderer.invoke('vnas:clearCookies'),
   },

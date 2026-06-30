@@ -40,10 +40,12 @@ export function LiveScope({
   facility,
   allSectors,
   sectorList,
+  vicinityNm = 0,
 }: {
   facility: string;
   allSectors: boolean;
   sectorList: string[];
+  vicinityNm?: number;
 }) {
   const [geometry, setGeometry] = useState<SectorGeometry[]>([]);
   const [tracks, setTracks] = useState<Track[]>([]);
@@ -143,21 +145,35 @@ export function LiveScope({
   const haveBox = Number.isFinite(minLon);
   const midLat = haveBox ? (minLat + maxLat) / 2 : 0;
   const lonScale = Math.cos((midLat * Math.PI) / 180) || 1;
-  const spanLon = haveBox ? (maxLon - minLon) * lonScale || 1 : 1;
-  const spanLat = haveBox ? maxLat - minLat || 1 : 1;
+  // Geofence ring = the polygon bbox expanded by the capture radius (matches the
+  // bridge's vicinity_bbox). The VIEW adds a small margin so a thin ring of
+  // not-captured "other traffic" stays visible at the edges.
+  const dLat = vicinityNm / 60;
+  const dLon = vicinityNm / 60 / lonScale;
+  const gMinLon = minLon - dLon, gMaxLon = maxLon + dLon, gMinLat = minLat - dLat, gMaxLat = maxLat + dLat;
+  const mLon = (gMaxLon - gMinLon) * 0.12, mLat = (gMaxLat - gMinLat) * 0.12;
+  const vMinLon = gMinLon - mLon, vMaxLon = gMaxLon + mLon, vMinLat = gMinLat - mLat, vMaxLat = gMaxLat + mLat;
+  const spanLon = haveBox ? (vMaxLon - vMinLon) * lonScale || 1 : 1;
+  const spanLat = haveBox ? vMaxLat - vMinLat || 1 : 1;
   const scale = Math.min((W - 2 * PAD) / spanLon, (H - 2 * PAD) / spanLat);
   const project = (lon: number, lat: number): [number, number] => [
-    PAD + (lon - minLon) * lonScale * scale,
-    PAD + (maxLat - lat) * scale,
+    PAD + (lon - vMinLon) * lonScale * scale,
+    PAD + (vMaxLat - lat) * scale,
   ];
 
+  const mineOf = (t: Track) => t.fac === fac && isSelectedSector(t.sec);
+  // What the capture actually records: owned/geometry always, plus anything in
+  // the geofence bbox when a radius is set.
+  const capturedOf = (t: Track) =>
+    mineOf(t) || (vicinityNm > 0 && t.lon >= gMinLon && t.lon <= gMaxLon && t.lat >= gMinLat && t.lat <= gMaxLat);
+
   const ours = tracks
-    .filter(t => t.fac === fac && isSelectedSector(t.sec))
+    .filter(capturedOf)
     .sort((a, b) => a.callsign.localeCompare(b.callsign));
   const captured = ours.filter(t => t.hasRoute).length;
 
-  const inBox = (t: Track) =>
-    haveBox && t.lon >= minLon && t.lon <= maxLon && t.lat >= minLat && t.lat <= maxLat;
+  const inView = (t: Track) =>
+    haveBox && t.lon >= vMinLon && t.lon <= vMaxLon && t.lat >= vMinLat && t.lat <= vMaxLat;
 
   return (
     <div className="row" style={{ gap: 12, alignItems: 'flex-start', flexWrap: 'wrap' }}>
@@ -180,16 +196,24 @@ export function LiveScope({
               />
             )),
           )}
+          {/* geofence ring (the capture radius) */}
+          {haveBox && vicinityNm > 0 && (() => {
+            const [x1, y1] = project(gMinLon, gMaxLat);
+            const [x2, y2] = project(gMaxLon, gMinLat);
+            return <rect x={x1} y={y1} width={x2 - x1} height={y2 - y1} fill="none"
+              stroke="#3a4a5a" strokeWidth={1} strokeDasharray="4 4" />;
+          })()}
           {/* tracks */}
           {haveBox &&
-            tracks.filter(inBox).map(t => {
+            tracks.filter(inView).map(t => {
               const [x, y] = project(t.lon, t.lat);
-              const mine = t.fac === fac && isSelectedSector(t.sec);
-              const color = mine ? (t.hasRoute ? '#39ff88' : '#ffd24a') : '#52606d';
+              const cap = capturedOf(t);
+              const mine = mineOf(t);
+              const color = !cap ? '#52606d' : !t.hasRoute ? '#ffd24a' : mine ? '#39ff88' : '#7aa2ff';
               return (
                 <g key={t.gufi}>
-                  <circle cx={x} cy={y} r={mine ? 3 : 2} fill={color} />
-                  {mine && (
+                  <circle cx={x} cy={y} r={cap ? 3 : 2} fill={color} />
+                  {cap && (
                     <text x={x + 5} y={y + 3} fill={color} fontSize={9} fontFamily="monospace">
                       {t.callsign} {t.alt ? Math.round(t.alt / 100) : ''}
                     </text>
@@ -204,15 +228,16 @@ export function LiveScope({
           )}
         </svg>
         <div style={{ fontSize: 11, color: 'var(--fg-secondary)', marginTop: 4 }}>
-          <span style={{ color: '#39ff88' }}>● capturing</span>{'  '}
-          <span style={{ color: '#ffd24a' }}>● owned, no route (skipped)</span>{'  '}
-          <span style={{ color: '#52606d' }}>● other traffic</span>
+          <span style={{ color: '#39ff88' }}>● owned (you)</span>{'  '}
+          <span style={{ color: '#7aa2ff' }}>● neighbor/inbound (captured)</span>{'  '}
+          <span style={{ color: '#ffd24a' }}>● no route yet</span>{'  '}
+          <span style={{ color: '#52606d' }}>● not captured</span>
         </div>
       </div>
 
       <div style={{ flex: '1 1 240px', maxHeight: H, overflow: 'auto' }}>
         <div style={{ fontSize: 13, fontWeight: 600, marginBottom: 6 }}>
-          {fac} — {ours.length} owned · {captured} capturing
+          {fac} — {ours.length} captured · {captured} with route
         </div>
         <table style={{ width: '100%', fontSize: 11, borderCollapse: 'collapse' }}>
           <thead>

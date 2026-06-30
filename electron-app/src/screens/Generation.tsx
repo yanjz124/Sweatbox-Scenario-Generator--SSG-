@@ -220,12 +220,24 @@ export function Generation() {
               Save…
             </ThemedButton>
             {!isImported && (
-              <ThemedButton secondary onClick={() => setScreen('config')}>
-                ← Edit Config
-              </ThemedButton>
+              config.scenarioType === 'live_replay'
+                ? <ThemedButton secondary onClick={() => setScreen('edit')}>← Edit Aircraft</ThemedButton>
+                : <ThemedButton secondary onClick={() => setScreen('config')}>← Edit Config</ThemedButton>
             )}
             <ThemedButton secondary onClick={() => reset()}>
               New Scenario
+            </ThemedButton>
+            <ThemedButton
+              secondary
+              onClick={async () => {
+                const out =
+                  'C:\\Users\\JY\\AppData\\Local\\Temp\\claude\\c--Users-JY-OneDrive-Documents-Sweatbox-Scenario-Generator--SSG-\\be9fa5ac-df46-4e31-a606-df17db009f2a\\scratchpad\\scenario-dump.json';
+                setPush({ kind: 'pushing' });
+                const r = await window.ssg.vnas.dump(out);
+                setPush({ kind: 'done', ok: r.ok, message: r.message });
+              }}
+            >
+              Dump scenario (debug)
             </ThemedButton>
           </div>
           {push.kind === 'pushing' && (

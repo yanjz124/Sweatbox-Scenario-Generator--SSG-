@@ -1,4 +1,4 @@
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import * as os from 'node:os';
@@ -23,6 +23,10 @@ export type CaptureProgressCallback = (ev: CaptureProgress) => void;
 // Path to the stop-file for the in-flight capture (set while a capture runs);
 // `stopCapture` touches it so the bridge ends the capture gracefully.
 let currentStopFile: string | null = null;
+// Handle to the running capture subprocess so we can hard-kill it on quit
+// (Node does NOT kill spawned children when the app exits → orphaned captures
+// that keep streaming progress and double up the next run).
+let currentCaptureProc: ChildProcess | null = null;
 
 interface BridgeActionResult {
   status: string;
@@ -39,6 +43,7 @@ interface BridgeActionResult {
 async function runBridgeAction(
   payload: Record<string, unknown>,
   onProgress?: CaptureProgressCallback,
+  onSpawn?: (proc: ChildProcess) => void,
 ): Promise<BridgeActionResult> {
   const { cmd, args, cwd } = resolveBridgeCommand();
   const tmpFile = path.join(os.tmpdir(), `ssg-action-${Date.now()}.json`);
@@ -52,6 +57,7 @@ async function runBridgeAction(
         cwd,
         env: { ...process.env, PYTHONIOENCODING: 'utf-8' },
       });
+      if (onSpawn) onSpawn(proc);
       let stdout = '';
       let stderr = '';
       let stderrBuf = '';
@@ -199,6 +205,11 @@ export async function startCapture(
   req: CaptureRequest,
   onProgress?: CaptureProgressCallback,
 ): Promise<CaptureResult> {
+  // Refuse a second concurrent capture — two bridges streaming progress to one
+  // bar makes it jump back and forth (and doubles SwimServer load).
+  if (currentStopFile) {
+    return { status: 'error', message: 'A capture is already running. End it before starting another.' } as CaptureResult;
+  }
   const outputDir = path.join(app.getPath('userData'), 'captures');
   await fs.mkdir(outputDir, { recursive: true });
   const stopFile = path.join(os.tmpdir(), `ssg-stop-${Date.now()}`);
@@ -207,12 +218,24 @@ export async function startCapture(
     const r = await runBridgeAction(
       { action: 'capture', startServer: true, ...req, outputDir, stopFile },
       onProgress,
+      proc => { currentCaptureProc = proc; },
     );
     return r as CaptureResult;
   } finally {
     currentStopFile = null;
+    currentCaptureProc = null;
     fs.unlink(stopFile).catch(() => {});
   }
+}
+
+/** Hard-stop any running capture subprocess — called on app quit so a capture
+ *  is never orphaned (which would keep streaming and double the next run). */
+export function killCapture(): void {
+  if (currentCaptureProc) {
+    try { currentCaptureProc.kill(); } catch { /* already gone */ }
+    currentCaptureProc = null;
+  }
+  currentStopFile = null;
 }
 
 /** "End now": touch the stop-file so the running capture finishes gracefully. */

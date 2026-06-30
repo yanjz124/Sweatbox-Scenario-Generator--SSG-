@@ -317,6 +317,7 @@ from utils.data_pipeline import to_icao  # noqa: E402,F401
 # Populated by `dispatch()` for enroute runs and read by `main()` so we
 # can include per-type generation stats in the JSON response.
 _LAST_GENERATION_STATS = None  # Optional[dict]
+_LAST_ATC_ROSTER = None  # Optional[list] — pseudo-ATC roster for live_replay
 
 
 def dispatch(cfg):
@@ -334,6 +335,9 @@ def dispatch(cfg):
         )
         aircraft = sc.generate()
         globals()['_LAST_GENERATION_STATS'] = getattr(sc, 'generation_stats', None)
+        # Pseudo-ATC roster: controllers that staff the positions aircraft are
+        # auto-tracked to (so tracks are owned at load + handoffs flash).
+        globals()['_LAST_ATC_ROSTER'] = getattr(sc, 'atc_roster', None) or []
         # Return the ARTCC facility as the identifier so the exporter uses the
         # enroute (artccId) path rather than an airport code.
         return aircraft, sc.facility
@@ -746,8 +750,17 @@ def _action_capture(cfg, logger):
         # Parsed by the Electron capture IPC for the progress display.
         logger.info(f"Capture progress: {int(elapsed)}/{int(total)}s recorded={n} sectors={sectors}")
 
+    # Compute the output path up front and autosave to it during capture, so a
+    # crash/disconnect/early-stop never loses the data — it's always on disk.
+    out_dir = Path(cfg.get('outputDir') or (Path.home() / 'SSG' / 'captures'))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    short = facility[1:] if facility.startswith('K') and len(facility) == 4 else facility
+    sec_label = 'ALL' if facility_wide else '-'.join(sector_list)
+    fname = out_dir / f"{short}_{sec_label}_{datetime.now().strftime('%d%H%M')}.capture.json"
+
     try:
-        result = client.capture(window, progress_callback=progress, stop_event=stop_event)
+        result = client.capture(window, progress_callback=progress, stop_event=stop_event,
+                                autosave_path=str(fname))
     finally:
         if stop_file:
             try:
@@ -755,11 +768,6 @@ def _action_capture(cfg, logger):
             except OSError:
                 pass
 
-    out_dir = Path(cfg.get('outputDir') or (Path.home() / 'SSG' / 'captures'))
-    out_dir.mkdir(parents=True, exist_ok=True)
-    short = facility[1:] if facility.startswith('K') and len(facility) == 4 else facility
-    sec_label = 'ALL' if facility_wide else '-'.join(sector_list)
-    fname = out_dir / f"{short}_{sec_label}_{datetime.now().strftime('%d%H%M')}.capture.json"
     result.write(fname)
     return {
         'status': 'ok',
@@ -807,42 +815,103 @@ def _action_route_sectors(cfg, logger):
     return {'status': 'ok', 'routeSectors': out}
 
 
-def _action_get_positions(cfg, logger):
-    """Pull the facility's vNAS positions (public data-api). Each enroute
-    position has eramConfiguration.sectorId → maps to SWIM controllingSector.
-    Returns positions for the ARTCC + child facilities so the editor can map
-    sectors → positions (with combining + fallback)."""
+def _fetch_artcc_raw(artcc_id, logger, cache_ttl=86400):
+    """Fetch + disk-cache an ARTCC's full config (the payloads are multi-MB, so
+    cache for a day). Returns the parsed JSON or None."""
+    import time as _t
     import requests
-    facility = (cfg.get('facility') or '').strip().upper()
-    if not facility:
-        return {'status': 'error', 'message': 'facility required'}
-    try:
-        url = f"https://data-api.vnas.vatsim.net/api/artccs/{facility}"
-        data = requests.get(url, timeout=20).json()
-    except Exception as e:  # noqa: BLE001
-        return {'status': 'error', 'message': f'vNAS API error: {e}'}
+    cache_dir = Path(os.environ.get('LOCALAPPDATA') or os.path.expanduser('~')) / 'SSG' / 'poscache'
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cf = cache_dir / f"{artcc_id}.json"
+    if cf.exists() and (_t.time() - cf.stat().st_mtime) < cache_ttl:
+        try:
+            return json.loads(cf.read_text('utf-8'))
+        except Exception:  # noqa: BLE001
+            pass
+    # Retry: under concurrent load the data-api can transiently fail/rate-limit,
+    # which silently dropped neighbor ARTCCs (so the editor showed ZDC only).
+    url = f"https://data-api.vnas.vatsim.net/api/artccs/{artcc_id}"
+    last_err = None
+    for attempt in range(3):
+        try:
+            r = requests.get(url, timeout=30)
+            r.raise_for_status()
+            data = r.json()
+            cf.write_text(json.dumps(data), encoding='utf-8')
+            return data
+        except Exception as e:  # noqa: BLE001
+            last_err = e
+            _t.sleep(0.4 * (attempt + 1))
+    # Last resort: serve a stale cache rather than dropping the facility.
+    if cf.exists():
+        try:
+            logger.warning(f"fetch ARTCC {artcc_id} failed ({last_err}); using stale cache")
+            return json.loads(cf.read_text('utf-8'))
+        except Exception:  # noqa: BLE001
+            pass
+    logger.warning(f"fetch ARTCC {artcc_id} failed after retries: {last_err}")
+    return None
 
-    positions = []
+
+def _extract_positions(data, artcc_id, is_neighbor):
+    """Flatten an ARTCC's positions (incl. child TRACONs/towers), each tagged
+    with its facility name + type for grouping in the editor."""
+    out = []
 
     def walk(fac):
         if not isinstance(fac, dict):
             return
-        fac_name = fac.get('name')
         for p in (fac.get('positions') or []):
-            sector_id = ((p.get('eramConfiguration') or {}) or {}).get('sectorId')
-            positions.append({
+            out.append({
                 'id': p.get('id'),
-                'sectorId': sector_id,
+                'sectorId': ((p.get('eramConfiguration') or {}) or {}).get('sectorId'),
                 'name': p.get('name'),
                 'callsign': p.get('callsign'),
                 'frequency': p.get('frequency'),
-                'facility': fac_name,
+                'facility': fac.get('name'),
+                'facilityId': fac.get('id'),
+                'facilityType': fac.get('type'),
+                'artcc': artcc_id,
+                'isNeighbor': is_neighbor,
             })
         for c in (fac.get('childFacilities') or []):
             walk(c)
 
-    walk(data.get('facility', {}))
-    return {'status': 'ok', 'facility': facility, 'positions': positions}
+    walk((data or {}).get('facility', {}))
+    return out
+
+
+def _action_get_positions(cfg, logger):
+    """Pull vNAS positions for the facility, its child TRACONs/towers, AND its
+    neighboring ARTCCs (so the editor can map TRACON + inter-facility handoff
+    positions, not just enroute). Each position is tagged with its facility for
+    grouped selection. Neighbor payloads are disk-cached."""
+    import concurrent.futures
+    facility = (cfg.get('facility') or '').strip().upper()
+    logger.info(f"get_positions: facility={facility!r}")
+    if not facility:
+        return {'status': 'error', 'message': 'facility required'}
+
+    target = _fetch_artcc_raw(facility, logger, cache_ttl=0)  # always fresh for the target
+    if target is None:
+        return {'status': 'error', 'message': f'could not fetch {facility} from vNAS'}
+
+    positions = _extract_positions(target, facility, is_neighbor=False)
+
+    # Neighboring ARTCCs (Z*) — fetch their positions too (cached, concurrent).
+    neighbors = [n for n in (target.get('facility', {}).get('neighboringFacilityIds') or [])
+                 if isinstance(n, str) and n.startswith('Z') and n != facility]
+    if neighbors and cfg.get('includeNeighbors', True):
+        with concurrent.futures.ThreadPoolExecutor(max_workers=6) as ex:
+            results = ex.map(lambda z: (z, _fetch_artcc_raw(z, logger)), neighbors)
+            for z, data in results:
+                if data is not None:
+                    positions.extend(_extract_positions(data, z, is_neighbor=True))
+
+    with_sec = sum(1 for p in positions if p.get('sectorId'))
+    logger.info(f"get_positions: {facility} (+{len(neighbors)} neighbors) -> "
+                f"{len(positions)} positions ({with_sec} with sectorId)")
+    return {'status': 'ok', 'facility': facility, 'positions': positions, 'neighbors': neighbors}
 
 
 def _action_get_sectors(cfg, logger):
@@ -981,6 +1050,7 @@ def main(config_path):
         artcc_id,
         cfg.get('scenarioName') or cfg['scenarioType'],
         str(out_dir),
+        atc=_LAST_ATC_ROSTER,
     )
     logger.info(f"Generated {len(aircraft)} aircraft -> {filename}")
     response = {

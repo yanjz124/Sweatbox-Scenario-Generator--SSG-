@@ -3,7 +3,7 @@ import { useEffect, useRef, useState } from 'react';
 import { useScenarioStore } from '../state/scenarioStore';
 import { Card, Section, ThemedButton, ThemedInput } from '../components/Themed';
 import { LiveScope } from '../components/LiveScope';
-import type { CaptureResult, SwimCredentialsStatus } from '../../shared/types';
+import type { CaptureResult, SwimCredentialsStatus, CaptureFileInfo } from '../../shared/types';
 
 type CaptureState =
   | { kind: 'idle' }
@@ -81,8 +81,8 @@ export function LiveCapture() {
   const [readiness, setReadiness] = useState<{ total: number; withPlan: number }>({ total: 0, withPlan: 0 });
   const [hold, setHold] = useState(config.holdInitialAltitude ?? false);
   const [scenarioName, setScenarioName] = useState('');
-  const [vicinityEnabled, setVicinityEnabled] = useState(false);
-  const [vicinityNm, setVicinityNm] = useState(40);
+  const [vicinityEnabled, setVicinityEnabled] = useState(true);
+  const [vicinityNm, setVicinityNm] = useState(100);
 
   // ── schedule ──
   const [scheduleEnabled, setScheduleEnabled] = useState(false);
@@ -90,7 +90,18 @@ export function LiveCapture() {
   const [now, setNow] = useState(Date.now());
 
   const [capture, setCapture] = useState<CaptureState>({ kind: 'idle' });
+  const [prevCaptures, setPrevCaptures] = useState<CaptureFileInfo[]>([]);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  const loadPrev = async () => {
+    try { setPrevCaptures(await window.ssg.liveCapture.listCaptures()); } catch { /* ignore */ }
+  };
+  useEffect(() => { void loadPrev(); }, []);
+
+  const openCapture = (info: CaptureFileInfo, screen: 'edit' | 'generation') => {
+    update({ scenarioType: 'live_replay', captureFile: info.path });
+    setScreen(screen);
+  };
 
   useEffect(() => {
     (async () => {
@@ -237,6 +248,7 @@ export function LiveCapture() {
       setCapture({ kind: 'error', message: String(e) });
     } finally {
       unsubscribe();
+      void loadPrev();
     }
   };
 
@@ -311,6 +323,37 @@ export function LiveCapture() {
       </p>
 
       <div className="stack" style={{ gap: 20 }}>
+        {prevCaptures.length > 0 && (
+          <Section title="Previous captures (recoverable)">
+            <div style={{ maxHeight: 150, overflow: 'auto' }}>
+              {prevCaptures.map(c => (
+                <div key={c.path} className="row"
+                  style={{ gap: 8, alignItems: 'center', justifyContent: 'space-between',
+                           borderBottom: '1px solid var(--border)', padding: '3px 0', fontSize: 12 }}>
+                  <span style={{ color: 'var(--fg-secondary)' }}>
+                    <strong style={{ color: 'var(--fg)' }}>{c.facility}/{c.sector}</strong>
+                    {' · '}{c.aircraftCount} a/c{' · '}{new Date(c.mtimeMs).toLocaleString()}
+                  </span>
+                  <span className="row" style={{ gap: 6 }}>
+                    <ThemedButton secondary onClick={() => openCapture(c, 'edit')}>Edit</ThemedButton>
+                    <ThemedButton secondary onClick={() => openCapture(c, 'generation')}>Generate</ThemedButton>
+                    <ThemedButton
+                      secondary
+                      onClick={async () => {
+                        if (!window.confirm(`Delete this capture (${c.facility}/${c.sector}, ${c.aircraftCount} a/c)? This cannot be undone.`)) return;
+                        const r = await window.ssg.liveCapture.deleteCapture(c.path);
+                        if (r.ok) setPrevCaptures(prev => prev.filter(p => p.path !== c.path));
+                        else window.alert(`Delete failed: ${r.message ?? 'unknown error'}`);
+                      }}
+                    >
+                      Delete
+                    </ThemedButton>
+                  </span>
+                </div>
+              ))}
+            </div>
+          </Section>
+        )}
         <Section title="SWIM Credentials (SFDPS)">
           <div className="stack" style={{ gap: 10 }}>
             <Field label="Username / email">
@@ -397,7 +440,7 @@ export function LiveCapture() {
           </label>
           <label className="row" style={{ gap: 8, alignItems: 'center', fontSize: 13 }}>
             <input type="checkbox" checked={vicinityEnabled} onChange={e => setVicinityEnabled(e.target.checked)} />
-            Also capture nearby (vicinity) traffic within
+            Geofence: also capture neighbor/inbound traffic within
             <ThemedInput
               type="number"
               min={0}
@@ -406,7 +449,7 @@ export function LiveCapture() {
               onChange={e => setVicinityNm(Number(e.target.value) || 0)}
               disabled={!vicinityEnabled}
             />
-            NM (curate in the editor)
+            NM — spawns owned by their neighbor sector &amp; flashes to you in flow
           </label>
           {srv.connected && capture.kind !== 'running' && (() => {
             const pct = readiness.total ? Math.round((100 * readiness.withPlan) / readiness.total) : 0;
@@ -481,6 +524,7 @@ export function LiveCapture() {
               facility={facility.trim().toUpperCase()}
               allSectors={allSectors}
               sectorList={allSectors ? [] : sector.split(',').map(s => s.trim()).filter(Boolean)}
+              vicinityNm={vicinityEnabled ? vicinityNm : 0}
             />
           </div>
         )}

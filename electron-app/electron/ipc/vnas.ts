@@ -1,4 +1,5 @@
 import { BrowserWindow, session } from 'electron';
+import { writeFileSync } from 'node:fs';
 import type { VNASUploadResult } from '../../shared/types';
 
 const LOGIN_URL = 'https://data-admin.vnas.vatsim.net/training';
@@ -294,7 +295,7 @@ async function injectSuccessToast(win: BrowserWindow, message: string): Promise<
 }
 
 export async function uploadScenario(scenarioContents: string): Promise<VNASUploadResult> {
-  let incoming: { aircraft?: unknown } & Record<string, unknown>;
+  let incoming: { aircraft?: unknown; atc?: unknown } & Record<string, unknown>;
   try {
     incoming = JSON.parse(scenarioContents);
   } catch (e) {
@@ -320,6 +321,12 @@ export async function uploadScenario(scenarioContents: string): Promise<VNASUplo
     try {
       const parsed = JSON.parse(existing.body) as Record<string, unknown>;
       parsed.aircraft = incoming.aircraft;
+      // Live-replay scenarios carry a pseudo-ATC roster (atc[]) so every track
+      // is owned at load. Push it too; for other scenario types incoming.atc is
+      // empty, so we leave the target's existing atc[] untouched.
+      if (Array.isArray(incoming.atc) && incoming.atc.length > 0) {
+        parsed.atc = incoming.atc;
+      }
       payload = parsed;
     } catch {
       payload = { ...incoming, id: scenarioId };
@@ -351,7 +358,10 @@ export async function uploadScenario(scenarioContents: string): Promise<VNASUplo
 
   if (put.status === 200 || put.status === 204) {
     const aircraftCount = (payload.aircraft as unknown[]).length;
-    const message = `Pushed ${aircraftCount} aircraft to vNAS.`;
+    const atcCount = Array.isArray(payload.atc) ? (payload.atc as unknown[]).length : 0;
+    const message = atcCount
+      ? `Pushed ${aircraftCount} aircraft + ${atcCount} ATC positions to vNAS.`
+      : `Pushed ${aircraftCount} aircraft to vNAS.`;
     // Fire-and-forget: overlay a green toast on the vNAS window so the user
     // sees confirmation right where they navigated to the scenario. Failing
     // to inject (window closed, navigation mid-push) is non-fatal.
@@ -372,6 +382,27 @@ export async function uploadScenario(scenarioContents: string): Promise<VNASUplo
     message: `Upload failed (status ${put.status}): ${put.body.slice(0, 500)}`,
     scenarioId,
   };
+}
+
+/** DEBUG: fetch the scenario the user is navigated to and write it verbatim to
+ *  outPath, so we can inspect the real atc[] / positionId schema. */
+export async function dumpScenario(outPath: string): Promise<{ ok: boolean; message: string }> {
+  let win: BrowserWindow;
+  let scenarioId: string;
+  try {
+    ({ win, scenarioId } = await ensureLogin());
+  } catch (e) {
+    return { ok: false, message: String(e instanceof Error ? e.message : e) };
+  }
+  const endpoint = `${API_BASE}/api/training/scenarios/${scenarioId}`;
+  const res = await browserFetch(win, endpoint, { method: 'GET' });
+  if (!res.ok) return { ok: false, message: `GET failed (status ${res.status}): ${res.body.slice(0, 300)}` };
+  try {
+    writeFileSync(outPath, res.body, 'utf-8');
+  } catch (e) {
+    return { ok: false, message: `write failed: ${String(e)}` };
+  }
+  return { ok: true, message: `Dumped scenario ${scenarioId} → ${outPath} (${res.body.length} bytes)` };
 }
 
 export function resetVnasSession(): void {

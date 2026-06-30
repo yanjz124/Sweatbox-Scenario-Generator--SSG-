@@ -21,7 +21,8 @@ class VNASJSONExporter:
         airport_icao: str = None,
         artcc_id: str = None,
         scenario_name: str = None,
-        output_dir: str = "."
+        output_dir: str = ".",
+        atc: List[dict] = None,
     ) -> str:
         """
         Export scenario as vNAS JSON file
@@ -74,7 +75,7 @@ class VNASJSONExporter:
             converter = VNASConverter("KZZZ", final_scenario_name, artcc_id)
 
         # Convert aircraft list to vNAS scenario JSON
-        scenario_json = converter.create_vnas_scenario(aircraft_list)
+        scenario_json = converter.create_vnas_scenario(aircraft_list, atc=atc)
 
         # Write JSON file with nice formatting
         with open(filepath, 'w', encoding='utf-8') as f:

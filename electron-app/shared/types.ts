@@ -267,6 +267,11 @@ export interface VnasPosition {
   callsign: string | null;
   frequency: number | null;
   facility: string | null;
+  /** Short facility id (ZDC / PCT / ZJX) — used for ATC roster facilityId. */
+  facilityId?: string | null;
+  facilityType?: string | null;
+  artcc?: string;
+  isNeighbor?: boolean;
 }
 
 export interface VnasPositionsResult {
@@ -287,6 +292,10 @@ export interface AtcConfig {
    *  aircraft owned by these, so the trainee does their own handoffs. The full
    *  capture data is preserved, so the same capture can target other sectors. */
   traineePositionIds?: string[];
+  /** Pseudo-controller roster: one entry per used position (combine-aware,
+   *  trainee seats excluded). The generator adds a ULID id + autoConnect and
+   *  emits these as the scenario's atc[] so tracks are owned at load. */
+  atcEntries?: Array<{ positionId: string; facilityId: string; artccId: string }>;
 }
 
 export interface CaptureAircraft {
@@ -326,6 +335,16 @@ export interface CaptureAircraft {
   }>;
   /** Editor-only: whether to include this aircraft in the generated scenario. */
   include?: boolean;
+}
+
+export interface CaptureFileInfo {
+  path: string;
+  filename: string;
+  facility: string;
+  sector: string;
+  aircraftCount: number;
+  captureStart: string;
+  mtimeMs: number;
 }
 
 export interface CaptureFile {
@@ -414,8 +433,10 @@ declare global {
           facility: string,
           captureFile: string,
         ): Promise<{ status: string; routeSectors?: Record<string, string[]>; message?: string }>;
+        listCaptures(): Promise<CaptureFileInfo[]>;
         readCapture(filePath: string): Promise<CaptureFile | null>;
         writeCapture(data: CaptureFile): Promise<string>;
+        deleteCapture(filePath: string): Promise<{ ok: boolean; message?: string }>;
         startCapture(req: CaptureRequest): Promise<CaptureResult>;
         stopCapture(): Promise<{ stopped: boolean }>;
         onProgress(
@@ -433,6 +454,7 @@ declare global {
       };
       vnas: {
         upload(scenarioContents: string): Promise<VNASUploadResult>;
+        dump(outPath: string): Promise<{ ok: boolean; message: string }>;
         reset(): Promise<void>;
         clearCookies(): Promise<void>;
       };
