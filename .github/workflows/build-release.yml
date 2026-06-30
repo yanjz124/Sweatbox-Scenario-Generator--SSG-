@@ -25,6 +25,16 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Version + release tag are derived from the commit hash so every build is
+      # self-identifying (no manual swim.N bumping).
+      - name: Compute version from commit
+        shell: bash
+        run: |
+          SHA=$(git rev-parse --short HEAD)
+          echo "SSG_SHA=$SHA" >> "$GITHUB_ENV"
+          echo "SSG_VERSION=2.2.0-swim.$SHA" >> "$GITHUB_ENV"
+          echo "Building version 2.2.0-swim.$SHA"
+
       # ── Python bridge (ssg_bridge.exe) ─────────────────────────────────────
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -84,6 +94,11 @@ jobs:
           npm ci
           npm run build
 
+      - name: Stamp version (commit hash)
+        working-directory: electron-app
+        shell: bash
+        run: npm version "$SSG_VERSION" --no-git-tag-version --allow-same-version
+
       - name: Package installer (electron-builder)
         working-directory: electron-app
         env:
@@ -93,12 +108,16 @@ jobs:
       - name: Upload installer artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ssg-installer
+          name: ssg-installer-${{ env.SSG_SHA }}
           path: electron-app/release/*.exe
 
-      - name: Attach to GitHub Release (on tag)
-        if: startsWith(github.ref, 'refs/tags/')
+      # Publish a release tagged with the commit hash for every dispatched build
+      # (and tag pushes). The auto-updater points at this fork's releases.
+      - name: Publish release (commit hash)
+        if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.SSG_SHA }}
+          name: SSG ${{ env.SSG_VERSION }}
           files: electron-app/release/*.exe
           generate_release_notes: true
