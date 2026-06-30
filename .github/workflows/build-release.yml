@@ -119,5 +119,8 @@ jobs:
         with:
           tag_name: ${{ env.SSG_SHA }}
           name: SSG ${{ env.SSG_VERSION }}
-          files: electron-app/release/*.exe
+          files: |
+            electron-app/release/*.exe
+            electron-app/release/*.exe.blockmap
+            electron-app/release/latest.yml
           generate_release_notes: true

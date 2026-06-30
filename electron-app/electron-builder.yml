@@ -2,6 +2,14 @@ appId: dev.creativeshrimp.ssg
 productName: Sweatbox Scenario Generator
 copyright: Copyright © 2026 Creative Shrimp
 
+# Auto-update + update-metadata target (the live-SWIM fork's Releases). Without
+# this electron-builder crashes generating update info ("Cannot read … provider").
+# --publish never still builds latest.yml locally; CI uploads it to the release.
+publish:
+  provider: github
+  owner: yanjz124
+  repo: Sweatbox-Scenario-Generator--SSG-
+
 directories:
   output: release
   buildResources: build
