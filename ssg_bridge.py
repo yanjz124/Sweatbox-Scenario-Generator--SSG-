@@ -885,6 +885,33 @@ def _extract_positions(data, artcc_id, is_neighbor):
     return out
 
 
+def _extract_facility_airports(data):
+    """Map each facility id -> the 3-letter airport ids it CONTROLS (its own id if
+    it's an ATCT/AtctTracon/AtctRapcon, plus its direct ATCT children). A TRACON's
+    autoTrackAirportIds must only contain airports it controls, else vNAS rejects
+    it ("Airport is not controlled by your facility")."""
+    out = {}
+
+    def walk(fac):
+        if not isinstance(fac, dict):
+            return
+        fid = fac.get('id')
+        ftype = fac.get('type') or ''
+        ids = set()
+        if ftype in ('Atct', 'AtctTracon', 'AtctRapcon') and fid:
+            ids.add(fid)
+        for c in (fac.get('childFacilities') or []):
+            if (c.get('type') or '') == 'Atct' and c.get('id'):
+                ids.add(c['id'])
+        if fid and ids:
+            out[fid] = sorted(ids)
+        for c in (fac.get('childFacilities') or []):
+            walk(c)
+
+    walk((data or {}).get('facility', {}))
+    return out
+
+
 def _action_get_positions(cfg, logger):
     """Pull vNAS positions for the facility, its child TRACONs/towers, AND its
     neighboring ARTCCs (so the editor can map TRACON + inter-facility handoff
@@ -901,6 +928,7 @@ def _action_get_positions(cfg, logger):
         return {'status': 'error', 'message': f'could not fetch {facility} from vNAS'}
 
     positions = _extract_positions(target, facility, is_neighbor=False)
+    facility_airports = _extract_facility_airports(target)
 
     # Neighboring ARTCCs (Z*) — fetch their positions too (cached, concurrent).
     neighbors = [n for n in (target.get('facility', {}).get('neighboringFacilityIds') or [])
@@ -911,11 +939,13 @@ def _action_get_positions(cfg, logger):
             for z, data in results:
                 if data is not None:
                     positions.extend(_extract_positions(data, z, is_neighbor=True))
+                    facility_airports.update(_extract_facility_airports(data))
 
     with_sec = sum(1 for p in positions if p.get('sectorId'))
     logger.info(f"get_positions: {facility} (+{len(neighbors)} neighbors) -> "
                 f"{len(positions)} positions ({with_sec} with sectorId)")
-    return {'status': 'ok', 'facility': facility, 'positions': positions, 'neighbors': neighbors}
+    return {'status': 'ok', 'facility': facility, 'positions': positions,
+            'neighbors': neighbors, 'facilityAirports': facility_airports}
 
 
 def _action_get_sectors(cfg, logger):

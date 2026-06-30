@@ -116,12 +116,23 @@ class LiveReplayScenario:
             for e in (atc.get("atcEntries") or []) if e.get("positionId")
         }
         self.atc_roster: List[Dict] = []
+        # STARS/TRACON positions auto-track by destination airport instead of
+        # per-aircraft InitiateControl (which fails "ILL TRK" on enroute tracks).
+        # positionId -> set of 3-letter airport ids to put in autoTrackAirportIds.
+        self._stars_airports: Dict[str, set] = {}
 
     def _build_atc_roster(self, position_ids) -> List[Dict]:
-        """One auto-connecting pseudo controller per position that actually owns
-        a track (fallback + trainee included), so nothing loads unowned."""
+        """One auto-connecting pseudo controller per position that owns a track:
+        ERAM positions assigned per-aircraft (fallback + trainee included), PLUS
+        STARS positions that auto-track by airport. Nothing loads unowned."""
         roster: List[Dict] = []
-        for pid in dict.fromkeys(p for p in position_ids if p):  # dedupe, ordered
+        # Staff every position the editor listed (all facility sectors + used
+        # neighbor/TRACON positions), plus any actually-assigned/STARS positions —
+        # so handoffs to quiet in-house sectors don't hit "SECTOR NOT ACTIVE".
+        ids = list(self._atc_meta.keys()) + list(position_ids) + list(self._stars_airports.keys())
+        for pid in dict.fromkeys(p for p in ids if p):  # dedupe, ordered
+            # Trainee seat IS staffed by a ghost too (owns its tracks at load);
+            # the student takes over that position when they sign in.
             meta = self._atc_meta.get(pid) or {}
             roster.append({
                 "id": _ulid(),
@@ -129,7 +140,7 @@ class LiveReplayScenario:
                 "facilityId": meta.get("facilityId") or meta.get("artccId") or self.facility,
                 "positionId": pid,
                 "autoConnect": True,
-                "autoTrackAirportIds": [],
+                "autoTrackAirportIds": sorted(self._stars_airports.get(pid, set())),
             })
         return roster
 
@@ -164,7 +175,7 @@ class LiveReplayScenario:
         # track loads as "Position not found".
         if self.atc_enabled:
             self.atc_roster = self._build_atc_roster(
-                a.auto_track_position_id for a in aircraft if getattr(a, "auto_track_position_id", None)
+                [a.auto_track_position_id for a in aircraft if getattr(a, "auto_track_position_id", None)]
             )
 
         self.generation_stats = {
@@ -287,39 +298,109 @@ class LiveReplayScenario:
             okey = f"{(ent.get('controllingFacility') or '').upper()}/{(ent.get('controllingSector') or '').upper()}"
             posid = self.owner_to_position.get(okey) or self.fallback_position
             if posid:
-                aircraft.auto_track_position_id = posid
                 is_trainee = posid in self.trainee_positions
-                # Auto-handoff timing from the captured timeline — but NOT for
-                # the trainee's own positions (they handle their handoffs).
-                # Hand off to the student (trainee) ONLY for aircraft the capture
-                # actually handed to the trainee's sector — at the captured time.
-                # autoTrackConditions.handoffDelay hands to the student, so setting
-                # it only on trainee-bound traffic gives the realistic "inbound
-                # flashes to you" flow without flooding (or erroring on) every ac.
-                if (self.atc_handoff_from_timeline and not is_trainee
-                        and self.trainee_owner_keys):
-                    first = int(entry.get("firstSeenOffsetSec") or 0)
-                    for h in (entry.get("handoffs") or []):
-                        tk = f"{(h.get('toFacility') or '').upper()}/{(h.get('toSector') or '').upper()}"
-                        if tk in self.trainee_owner_keys and h.get("atOffsetSec") is not None:
-                            delay = int(h["atOffsetSec"]) - first
-                            if delay > 0:
-                                aircraft.auto_track_handoff_delay = delay
-                            break
-                # Re-issue the captured controller instructions via the fake ATC
-                # so the AI pilots execute them — but NEVER for the trainee's own
-                # sector (the trainee gives those clearances themselves).
+                is_stars = bool((self._atc_meta.get(posid) or {}).get("isStars"))
+                if is_stars and not is_trainee:
+                    # STARS/TRACON can't InitiateControl an enroute-positioned
+                    # track (ILL TRK). It auto-tracks by destination airport — but
+                    # ONLY airports it controls (else vNAS errors "not controlled").
+                    # Aircraft going elsewhere (transiting) fall to the enroute
+                    # fallback instead.
+                    controlled = set((self._atc_meta.get(posid) or {}).get("airports") or [])
+                    apt = self._airport3(destination)
+                    if apt and apt in controlled:
+                        self._stars_airports.setdefault(posid, set()).add(apt)
+                    elif self.fallback_position:
+                        aircraft.auto_track_position_id = self.fallback_position
+                else:
+                    # Own the track with its sector's ghost. Handoffs then happen
+                    # NORMALLY — vNAS ghosts hand off to each other by airspace as
+                    # aircraft cross sectors, including to the trainee position's
+                    # ghost; the student signs into that position and receives them.
+                    # (No handoffDelay-to-student, which needs a student designated
+                    # in the scenario and otherwise errors "student must be specified".)
+                    aircraft.auto_track_position_id = posid
+                # Re-issue captured controller instructions (AI executes them) —
+                # NOT for the trainee's own sector, and only when AIRBORNE. A CM on
+                # a ground aircraft errors ("can not climb/descend on the ground"),
+                # and ground speed alone isn't enough (taxi/takeoff roll have speed
+                # but are still on the ground) — also require some altitude.
+                airborne = ground_speed >= 40 and spawn_alt >= 1500
+                on_arrival = bool((fp.get("star") or "").strip())
+                first = int(entry.get("firstSeenOffsetSec") or 0)
+                cmds: List[str] = []
                 if not is_trainee:
-                    cmds, scratch = self._clearance_commands(
-                        entry.get("clearances") or {}, cruise_alt,
-                        on_arrival=bool((fp.get("star") or "").strip()),
-                    )
-                    if cmds:
-                        aircraft.preset_commands = cmds
-                    if scratch:
-                        aircraft.auto_track_scratchpad = scratch
+                    timed: List[tuple] = []  # (offsetSec, command)
+                    # 1) Initial clearance at spawn (airborne only — a CM on the
+                    #    ground errors).
+                    if airborne:
+                        init_cmds, scratch = self._clearance_commands(
+                            entry.get("clearances") or {}, cruise_alt, on_arrival=on_arrival,
+                        )
+                        for c in init_cmds:
+                            timed.append((0, c))
+                        if scratch:
+                            aircraft.auto_track_scratchpad = scratch
+                    # 2) Timed clearance CHANGES (alt/speed/heading) at the times
+                    #    they happened — "all commands done as WAIT".
+                    for ev in (entry.get("clearanceEvents") or []):
+                        if ev.get("atOffsetSec") is None:
+                            continue
+                        c = self._event_command(ev)
+                        if c:
+                            timed.append((max(0, int(ev["atOffsetSec"]) - first), c))
+                    # 3) Full handoff chain, timed — to ANY facility (in-house,
+                    #    neighbor ARTCC, TRACON), targeting the next sector by its
+                    #    POSITION ID (universal; no adaptation codes). Each owning
+                    #    ghost flashes at the captured time; AI ghosts auto-accept,
+                    #    the trainee accepts the one to their sector. Only sectors
+                    #    we staffed (have a position) can be targeted.
+                    for h in (entry.get("handoffs") or []):
+                        if h.get("atOffsetSec") is None:
+                            continue
+                        to_key = f"{(h.get('toFacility') or '').upper()}/{(h.get('toSector') or '').upper()}"
+                        target = self.owner_to_position.get(to_key)
+                        if target:
+                            timed.append((max(0, int(h["atOffsetSec"]) - first), f"HO {target}"))
+                    # Emit in chronological order; t=0 immediate, rest as WAIT.
+                    timed.sort(key=lambda x: x[0])
+                    cmds = [c if t == 0 else f"WAIT {t} {c}" for t, c in timed]
+                if cmds:
+                    aircraft.preset_commands = cmds
 
         return aircraft, None
+
+    def _event_command(self, ev: Dict) -> Optional[str]:
+        """A timed clearance event -> a vNAS command (no WAIT prefix)."""
+        kind = ev.get("kind")
+        val = ev.get("value")
+        if kind in ("alt", "interim"):
+            n = _to_int(val)
+            return f"CM {self._alt_token(n)}" if n else None
+        if kind == "speed":
+            return self._speed_command(val)
+        if kind == "heading":
+            t = self._heading_token(val)
+            return f"FH {t}" if t else None
+        return None
+
+    @staticmethod
+    def _handoff_code(sector) -> str:
+        """ERAM handoff target code for a sector — e.g. sector 33 -> "T33"
+        (matches the `HO t33` form that works in CRC/ATCTrainer)."""
+        s = re.sub(r"[^0-9A-Za-z]", "", str(sector or "")).upper()
+        return f"T{s}" if s else ""
+
+    @staticmethod
+    def _airport3(icao) -> str:
+        """vNAS airport ids are 3-letter FAA (DCA, IAD) — strip the K from a
+        4-letter US ICAO. Non-US 4-letter codes are dropped (TRACONs are US)."""
+        c = (icao or "").strip().upper()
+        if len(c) == 4 and c.startswith("K") and c[1:].isalpha():
+            return c[1:]
+        if len(c) == 3 and c.isalpha():
+            return c
+        return ""
 
     # ── captured-clearance replay ───────────────────────────────────────────────
     def _clearance_commands(self, clr: Dict, cruise_alt, on_arrival: bool = False) -> tuple:

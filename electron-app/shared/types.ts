@@ -278,6 +278,8 @@ export interface VnasPositionsResult {
   status: string;
   facility?: string;
   positions?: VnasPosition[];
+  /** facilityId -> 3-letter airport ids that facility controls (for STARS autoTrack). */
+  facilityAirports?: Record<string, string[]>;
   message?: string;
 }
 
@@ -295,7 +297,7 @@ export interface AtcConfig {
   /** Pseudo-controller roster: one entry per used position (combine-aware,
    *  trainee seats excluded). The generator adds a ULID id + autoConnect and
    *  emits these as the scenario's atc[] so tracks are owned at load. */
-  atcEntries?: Array<{ positionId: string; facilityId: string; artccId: string }>;
+  atcEntries?: Array<{ positionId: string; facilityId: string; artccId: string; isStars?: boolean; airports?: string[] }>;
 }
 
 export interface CaptureAircraft {

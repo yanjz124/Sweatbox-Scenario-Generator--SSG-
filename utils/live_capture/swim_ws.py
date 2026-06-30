@@ -69,6 +69,9 @@ class CapturedAircraft:
     # Ownership/handoff timeline observed during the capture window:
     # [{atOffsetSec, fromFacility, fromSector, toFacility, toSector}, ...]
     handoffs: List[Dict] = field(default_factory=list)
+    # Clearance changes observed during the window (for timed replay):
+    # [{atOffsetSec, kind: 'alt'|'interim'|'speed'|'heading', value}, ...]
+    clearance_events: List[Dict] = field(default_factory=list)
     aircraft_type: Optional[str] = None
     wake: Optional[str] = None
     flight_rules: Optional[str] = None
@@ -202,7 +205,10 @@ class CaptureSession:
         self.recorded_by_sector: Dict[str, int] = {}
         # gufi -> last observed (facility, sector), for handoff-transition logging
         self._last_owner: Dict[str, tuple] = {}
+        # gufi -> last observed clearance dict, for change detection (timed replay)
+        self._last_clr: Dict[str, dict] = {}
         self._max_handoffs = 30  # cap per aircraft to avoid bloat
+        self._max_events = 60    # cap clearance events per aircraft
 
         # Vicinity region: bbox of the selected sector polygons, expanded by
         # vicinity_nm. Nearby (non-owned) traffic inside it is captured and
@@ -292,6 +298,7 @@ class CaptureSession:
         # capture inter-facility handoffs (e.g. ZJX66 → ZDC09).
         if gufi in self.recorded:
             self._track_handoff(gufi, flight, offset_sec)
+            self._track_clearances(gufi, flight, offset_sec)
             return False
 
         basis = self.membership_basis(flight)
@@ -344,8 +351,37 @@ class CaptureSession:
                 "fromSector": (prev[1] if prev else None),
                 "toFacility": fac,
                 "toSector": sec,
+                # Where the handoff happened (for location fidelity / reference).
+                "lat": _num(flight.get("latitude")),
+                "lon": _num(flight.get("longitude")),
+                "altitudeFt": _num(flight.get("reportedAltitude")) or _num(flight.get("assignedAltitude")),
             })
         self._last_owner[gufi] = cur
+
+    def _track_clearances(self, gufi: str, flight: dict, offset_sec: int) -> None:
+        """Append an event whenever a recorded aircraft's assigned/interim
+        altitude, clearance speed, or clearance heading changes — so the replay
+        can issue each clearance as a timed command at the captured time."""
+        cur = {
+            "alt": _num(flight.get("assignedAltitude")),
+            "interim": _num(flight.get("interimAltitude")),
+            "speed": (flight.get("clearanceSpeed") or None),
+            "heading": (flight.get("clearanceHeading") or None),
+        }
+        prev = self._last_clr.get(gufi)
+        if prev is None:
+            self._last_clr[gufi] = cur  # seed with the first-seen state (= spawn)
+            return
+        ac = self.recorded.get(gufi)
+        if ac is not None:
+            for kind in ("alt", "interim", "speed", "heading"):
+                if cur[kind] is not None and cur[kind] != prev[kind] and len(ac.clearance_events) < self._max_events:
+                    ac.clearance_events.append({
+                        "atOffsetSec": max(0, int(offset_sec)),
+                        "kind": kind,
+                        "value": cur[kind],
+                    })
+        self._last_clr[gufi] = cur
 
     def ingest_message(self, msg: dict, offset_sec: int) -> int:
         """Process a whole WS message ({type,data}); return # new entries."""
@@ -433,6 +469,7 @@ class CaptureResult:
                         "pointoutTo": a.pointout_to,
                     },
                     "handoffs": a.handoffs,
+                    "clearanceEvents": a.clearance_events,
                 }
                 for a in sorted(self.aircraft, key=lambda x: x.first_seen_offset_sec)
             ],

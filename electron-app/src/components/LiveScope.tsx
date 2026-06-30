@@ -53,6 +53,9 @@ export function LiveScope({
   const [err, setErr] = useState<string | null>(null);
   const tracksRef = useRef<Map<string, Track>>(new Map());
   const pz = useSvgPanZoom(W, H);
+  const [hidden, setHidden] = useState<Set<string>>(new Set());
+  const toggleCat = (c: string) =>
+    setHidden(p => { const n = new Set(p); n.has(c) ? n.delete(c) : n.add(c); return n; });
 
   const fac = facility.trim().toUpperCase();
   const selected = new Set(sectorList.map(normSector));
@@ -168,6 +171,12 @@ export function LiveScope({
   // the geofence bbox when a radius is set.
   const capturedOf = (t: Track) =>
     mineOf(t) || (vicinityNm > 0 && t.lon >= gMinLon && t.lon <= gMaxLon && t.lat >= gMinLat && t.lat <= gMaxLat);
+  const categoryOf = (t: Track): 'owned' | 'neighbor' | 'noroute' | 'other' => {
+    if (!capturedOf(t)) return 'other';
+    if (!t.hasRoute) return 'noroute';
+    return mineOf(t) ? 'owned' : 'neighbor';
+  };
+  const CAT_COLOR: Record<string, string> = { owned: '#39ff88', neighbor: '#7aa2ff', noroute: '#ffd24a', other: '#52606d' };
 
   const ours = tracks
     .filter(capturedOf)
@@ -188,7 +197,7 @@ export function LiveScope({
           width="100%"
           viewBox={pz.viewBox}
           {...pz.panHandlers}
-          style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', cursor: 'grab', touchAction: 'none' }}
+          style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', cursor: 'grab', touchAction: 'none', userSelect: 'none' }}
         >
           {/* sector polygons */}
           {geometry.map((s, si) =>
@@ -198,7 +207,7 @@ export function LiveScope({
                 points={ring.map(([lon, lat]) => project(lon, lat).join(',')).join(' ')}
                 fill="none"
                 stroke="#2e7d32"
-                strokeWidth={1}
+                strokeWidth={pz.k}
                 opacity={0.8}
               />
             )),
@@ -208,20 +217,22 @@ export function LiveScope({
             const [x1, y1] = project(gMinLon, gMaxLat);
             const [x2, y2] = project(gMaxLon, gMinLat);
             return <rect x={x1} y={y1} width={x2 - x1} height={y2 - y1} fill="none"
-              stroke="#3a4a5a" strokeWidth={1} strokeDasharray="4 4" />;
+              stroke="#3a4a5a" strokeWidth={pz.k} strokeDasharray={`${4 * pz.k} ${4 * pz.k}`} />;
           })()}
-          {/* tracks */}
+          {/* tracks (labels/dots stay constant on-screen size via pz.k) */}
           {haveBox &&
             tracks.filter(inView).map(t => {
+              const cat = categoryOf(t);
+              if (hidden.has(cat)) return null;
               const [x, y] = project(t.lon, t.lat);
-              const cap = capturedOf(t);
-              const mine = mineOf(t);
-              const color = !cap ? '#52606d' : !t.hasRoute ? '#ffd24a' : mine ? '#39ff88' : '#7aa2ff';
+              const cap = cat !== 'other';
+              const color = CAT_COLOR[cat];
+              const k = pz.k;
               return (
                 <g key={t.gufi}>
-                  <circle cx={x} cy={y} r={cap ? 3 : 2} fill={color} />
+                  <circle cx={x} cy={y} r={(cap ? 3 : 2) * k} fill={color} />
                   {cap && (
-                    <text x={x + 5} y={y + 3} fill={color} fontSize={9} fontFamily="monospace">
+                    <text x={x + 5 * k} y={y + 3 * k} fill={color} fontSize={9 * k} fontFamily="monospace">
                       {t.callsign} {t.alt ? Math.round(t.alt / 100) : ''}
                     </text>
                   )}
@@ -235,10 +246,13 @@ export function LiveScope({
           )}
         </svg>
         <div style={{ fontSize: 11, color: 'var(--fg-secondary)', marginTop: 4 }}>
-          <span style={{ color: '#39ff88' }}>● owned (you)</span>{'  '}
-          <span style={{ color: '#7aa2ff' }}>● neighbor/inbound (captured)</span>{'  '}
-          <span style={{ color: '#ffd24a' }}>● no route yet</span>{'  '}
-          <span style={{ color: '#52606d' }}>● not captured</span>
+          {([['owned', 'owned (you)'], ['neighbor', 'neighbor/inbound (captured)'], ['noroute', 'no route yet'], ['other', 'not captured']] as const).map(([key, label]) => (
+            <span key={key} onClick={() => toggleCat(key)} title="click to toggle"
+              style={{ color: CAT_COLOR[key], cursor: 'pointer', marginRight: 12, userSelect: 'none',
+                opacity: hidden.has(key) ? 0.35 : 1, textDecoration: hidden.has(key) ? 'line-through' : 'none' }}>
+              ● {label}
+            </span>
+          ))}
         </div>
       </div>
 

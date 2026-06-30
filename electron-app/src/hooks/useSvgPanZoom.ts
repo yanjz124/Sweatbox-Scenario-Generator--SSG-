@@ -55,6 +55,9 @@ export function useSvgPanZoom(W: number, H: number) {
     viewBox: `${vb.x} ${vb.y} ${vb.w} ${vb.h}`,
     reset,
     zoomed,
+    // Multiply base (screen-constant) sizes by this so labels/dots/strokes keep
+    // the same on-screen size regardless of zoom: size_in_viewBox = base * k.
+    k: vb.w / W,
     panHandlers: { onMouseDown, onMouseMove, onMouseUp, onMouseLeave: onMouseUp, onDoubleClick: reset },
   };
 }

@@ -26,6 +26,7 @@ export function LiveCaptureEdit() {
   const [cap, setCap] = useState<CaptureFile | null>(null);
   const [geom, setGeom] = useState<SectorGeometry[]>([]);
   const [positions, setPositions] = useState<VnasPosition[]>([]);
+  const [facilityAirports, setFacilityAirports] = useState<Record<string, string[]>>({});
   const [routeSectors, setRouteSectors] = useState<Record<string, string[]>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
@@ -54,6 +55,7 @@ export function LiveCaptureEdit() {
       const p = await window.ssg.liveCapture.getPositions(fac);
       if (p.status === 'ok' && p.positions && p.positions.length > 0) {
         setPositions(p.positions);
+        setFacilityAirports(p.facilityAirports || {});
         // auto-match + default fallback run reactively once positions land.
       } else {
         setPosError(p.message || `No positions returned for ${fac} (status: ${p.status}).`);
@@ -143,12 +145,22 @@ export function LiveCaptureEdit() {
       for (const k of activeOwners) {
         if (next[k]) continue;
         const [f, s] = k.split('/');
-        // ERAM enroute only: match the ARTCC sector by eram sectorId. TRACON
-        // owners are deliberately left for the (enroute) fallback — a STARS
-        // position can't take control of an enroute-positioned replay track
-        // (vNAS rejects it with "ILL TRK"), so terminal traffic is owned by an
-        // ERAM ghost instead.
-        const m = positions.find(pp => pp.artcc === f && pp.sectorId && normSec(pp.sectorId) === normSec(s));
+        // 1) ERAM enroute: match the ARTCC sector by eram sectorId.
+        let m = positions.find(pp => pp.artcc === f && pp.sectorId && normSec(pp.sectorId) === normSec(s));
+        // 2) TRACON/other facility (no eram sectorId): match by facilityId and
+        //    pick the facility's approach (e.g. PCT_APP). Note: a STARS position
+        //    may reject high/out-of-area replay tracks at load with "ILL TRK"
+        //    (non-fatal — those just stay unowned); set the fallback to an
+        //    enroute position if you'd rather own that terminal traffic there.
+        if (!m) {
+          const facPos = positions.filter(pp => pp.facilityId === f);
+          if (facPos.length) {
+            const up = (c: string | null) => (c || '').toUpperCase();
+            m = facPos.find(pp => up(pp.callsign) === `${f}_APP`)
+              || facPos.find(pp => up(pp.callsign).includes('_APP'))
+              || facPos[0];
+          }
+        }
         const id = m ? m.id : '';
         if (next[k] !== id) { next[k] = id; changed = true; }
       }
@@ -156,15 +168,8 @@ export function LiveCaptureEdit() {
     });
   }, [positions, activeOwners]);
 
-  // Default the fallback to the TOP position of the target facility's vNAS list
-  // (the primary/combined sector) — but ONLY until the user touches it, so they
-  // can deliberately set it to "none" without it snapping back.
-  const fallbackTouchedRef = useRef(false);
-  useEffect(() => {
-    if (fallbackTouchedRef.current || fallbackPos || positions.length === 0) return;
-    const top = positions.find(p => !p.isNeighbor) || positions[0];
-    if (top) setFallbackPos(top.id);
-  }, [positions, fallbackPos]);
+  // Fallback defaults to NONE — unmatched owners stay unowned unless the user
+  // explicitly picks a fallback position.
 
   // ── position picker: one shared datalist for all 1000+ positions (efficient
   // + searchable). label is unique so we can resolve label → id. ──
@@ -183,6 +188,22 @@ export function LiveCaptureEdit() {
     return m;
   }, [labelToId]);
   const posById = (id: string) => positions.find(p => p.id === id);
+  // Resolve an owner/handoff "FAC/SEC" key to a vNAS position id: ERAM by eram
+  // sectorId, else the facility's approach (TRACON). '' if none.
+  const matchPosition = (k: string): string => {
+    const [f, s] = k.split('/');
+    if (!f) return '';
+    const m = positions.find(pp => pp.artcc === f && pp.sectorId && normSec(pp.sectorId) === normSec(s));
+    if (m) return m.id;
+    const facPos = positions.filter(pp => pp.facilityId === f);
+    if (facPos.length) {
+      const up = (c: string | null) => (c || '').toUpperCase();
+      return (facPos.find(pp => up(pp.callsign) === `${f}_APP`)
+        || facPos.find(pp => up(pp.callsign).includes('_APP'))
+        || facPos[0]).id;
+    }
+    return '';
+  };
   const artccCount = useMemo(() => new Set(positions.map(p => p.artcc).filter(Boolean)).size, [positions]);
   const posLabel = (id: string) => {
     const p = posById(id);
@@ -292,17 +313,41 @@ export function LiveCaptureEdit() {
     try {
       const edited: CaptureFile = { ...cap, aircraft: included };
       if (atcEnabled) {
+        // sectorToPosition maps EVERY active "FAC/SEC" (owners + handoff partners)
+        // to its position id, so the replay can target handoffs by position id
+        // (HO {positionId}) for any facility — no adaptation codes needed. The
+        // same set of positions is staffed with ghosts.
         const map: Record<string, string> = {};
         for (const [k, p] of Object.entries(ownerToPosition)) if (p) map[k] = p;
-        // Metadata (facilityId/artccId) for every used position — trainee seats
-        // INCLUDED, so their tracks are owned at load too. The generator derives
-        // the actual roster from real aircraft assignments using this lookup.
-        const atcEntries = usedPosIds.map(id => {
+        const staffSet = new Set<string>();
+        const addKey = (key: string) => {
+          if (key === '/') return;
+          const id = ownerToPosition[key] || matchPosition(key);
+          if (id) { map[key] = id; staffSet.add(id); }
+        };
+        for (const a of included) {
+          addKey(ownerKey(a));
+          for (const h of (a.handoffs || [])) {
+            addKey(`${(h.fromFacility || '').toUpperCase()}/${(h.fromSector || '').toUpperCase()}`);
+            addKey(`${(h.toFacility || '').toUpperCase()}/${(h.toSector || '').toUpperCase()}`);
+          }
+        }
+        for (const id of usedPosIds) staffSet.add(id);
+        const staffIds = Array.from(staffSet);
+        const atcEntries = staffIds.map(id => {
           const p = posById(id);
+          // STARS/TRACON positions (terminal, no eram sectorId) auto-track by
+          // airport; ERAM positions take per-aircraft control.
+          const isStars = !!(p && (p.facilityType ? p.facilityType !== 'Artcc' : !p.sectorId));
+          const fid = p?.facilityId || '';
           return {
             positionId: id,
             facilityId: p?.facilityId || p?.artcc || cap.facility || '',
             artccId: p?.artcc || cap.facility || '',
+            isStars,
+            // Airports this STARS/TRACON controls — autoTrackAirportIds must be a
+            // subset of these or vNAS rejects it.
+            airports: isStars ? (facilityAirports[fid] || []) : [],
           };
         });
         edited.atcConfig = {
@@ -397,7 +442,7 @@ export function LiveCaptureEdit() {
               Fallback (unmatched owners):
               <select className="themed" style={{ minWidth: 240 }}
                 value={fallbackPos}
-                onChange={e => { fallbackTouchedRef.current = true; setFallbackPos(e.target.value); }}>
+                onChange={e => setFallbackPos(e.target.value)}>
                 <option value="">(none — leave unowned)</option>
                 {byFacility(Object.entries(mappedPositions.reduce((acc, id) => {
                   const p = posById(id);
@@ -413,7 +458,7 @@ export function LiveCaptureEdit() {
               <span style={{ color: 'var(--fg-secondary)' }}>or</span>
               <input list="ssg-positions" className="themed" style={{ minWidth: 200 }}
                 value="" placeholder="search any position…"
-                onChange={e => { const id = labelToId.get(e.target.value); if (id) { fallbackTouchedRef.current = true; setFallbackPos(id); } }} />
+                onChange={e => { const id = labelToId.get(e.target.value); if (id) setFallbackPos(id); }} />
             </label>
             <div style={{ maxHeight: '55vh', overflowY: 'auto', overflowX: 'hidden', fontSize: 12, border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 6 }}>
               {ownersByFacility.map(([fac, keys]) => (
@@ -542,19 +587,20 @@ export function LiveCaptureEdit() {
           scroll to zoom · drag to pan · double-click to reset
         </span>
       <svg ref={scopePz.ref} width="100%" viewBox={scopePz.viewBox} {...scopePz.panHandlers}
-        style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', cursor: 'grab', touchAction: 'none' }}>
+        style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', cursor: 'grab', touchAction: 'none', userSelect: 'none' }}>
         {geom.map((s, si) => s.rings.map((ring, ri) => (
           <polyline key={`${si}-${ri}`} points={ring.map(([lon, lat]) => project(lon, lat).join(',')).join(' ')}
-            fill="none" stroke="#2e7d32" strokeWidth={1} opacity={0.7} />
+            fill="none" stroke="#2e7d32" strokeWidth={scopePz.k} opacity={0.7} />
         )))}
         {box && aircraft.map(a => {
           if (a.spawn.lat == null || a.spawn.lon == null) return null;
           const [x, y] = project(a.spawn.lon, a.spawn.lat);
           const color = !a.include ? '#52606d' : a.category === 'vicinity' ? '#7aa2ff' : '#39ff88';
+          const k = scopePz.k;
           return (
             <g key={a.gufi}>
-              <circle cx={x} cy={y} r={a.include ? 3 : 2} fill={color} />
-              {a.include && <text x={x + 5} y={y + 3} fill={color} fontSize={8} fontFamily="monospace">{a.callsign}</text>}
+              <circle cx={x} cy={y} r={(a.include ? 3 : 2) * k} fill={color} />
+              {a.include && <text x={x + 5 * k} y={y + 3 * k} fill={color} fontSize={8 * k} fontFamily="monospace">{a.callsign}</text>}
             </g>
           );
         })}
