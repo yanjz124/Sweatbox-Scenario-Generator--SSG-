@@ -64,7 +64,8 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: ${{ vars.SWIMREADER_REPO }}
-          token: ${{ secrets.SWIMREADER_PAT }}
+          # PAT only needed if SwimReader is private; public repos use the default token.
+          token: ${{ secrets.SWIMREADER_PAT || github.token }}
           path: SwimReader
 
       - name: Build SwimServer
