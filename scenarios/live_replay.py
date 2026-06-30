@@ -119,23 +119,17 @@ class LiveReplayScenario:
             for e in (atc.get("atcEntries") or []) if e.get("positionId")
         }
         self.atc_roster: List[Dict] = []
-        # STARS/TRACON positions auto-track by destination airport instead of
-        # per-aircraft InitiateControl (which fails "ILL TRK" on enroute tracks).
-        # positionId -> set of 3-letter airport ids to put in autoTrackAirportIds.
-        self._stars_airports: Dict[str, set] = {}
 
     def _build_atc_roster(self, position_ids) -> List[Dict]:
-        """One auto-connecting pseudo controller per position that owns a track:
-        ERAM positions assigned per-aircraft (fallback + trainee included), PLUS
-        STARS positions that auto-track by airport. Nothing loads unowned."""
+        """One auto-connecting ghost per position that owns a track, INCLUDING the
+        student's own sector — its ghost owns the trainee's tracks at load and
+        gives handoffs a target to flash to; the human takes that seat over when
+        they sign in. Nothing loads unowned."""
         roster: List[Dict] = []
-        # Staff every position the editor listed (all facility sectors + used
-        # neighbor/TRACON positions), plus any actually-assigned/STARS positions —
-        # so handoffs to quiet in-house sectors don't hit "SECTOR NOT ACTIVE".
-        ids = list(self._atc_meta.keys()) + list(position_ids) + list(self._stars_airports.keys())
+        ids = list(position_ids)
+        if self.student_position_id:
+            ids.append(self.student_position_id)  # always staff the trainee seat
         for pid in dict.fromkeys(p for p in ids if p):  # dedupe, ordered
-            # Trainee seat IS staffed by a ghost too (owns its tracks at load);
-            # the student takes over that position when they sign in.
             meta = self._atc_meta.get(pid) or {}
             roster.append({
                 "id": _ulid(),
@@ -143,7 +137,7 @@ class LiveReplayScenario:
                 "facilityId": meta.get("facilityId") or meta.get("artccId") or self.facility,
                 "positionId": pid,
                 "autoConnect": True,
-                "autoTrackAirportIds": sorted(self._stars_airports.get(pid, set())),
+                "autoTrackAirportIds": [],
             })
         return roster
 
@@ -294,82 +288,99 @@ class LiveReplayScenario:
             difficulty="Easy",
         )
 
-        # Fake ATC: bind the aircraft to its sector's vNAS position (combine /
-        # fallback applied). The converter emits autoTrackConditions from this.
+        # Live ATC replay. Each aircraft is initially owned by a GHOST (its
+        # captured controlling sector). If the real-world traffic was handed INTO
+        # the trainee's sector, the owning ghost flashes the handoff to the
+        # student at the captured time via autoTrackConditions.handoffDelay.
+        #
+        # This is how working vNAS scenarios do it — NO preset HO commands (those
+        # only work for in-house ERAM sectors by adaptation code, never by id and
+        # never to a TRACON/neighbor). handoffDelay flashes to studentPositionId
+        # and works even when the owner is an external or TRACON ghost. A TRACON
+        # position can own an enroute track directly here (no ILL TRK), so the old
+        # autoTrackAirportIds workaround is gone too.
         if self.atc_enabled:
             ent = entry.get("entry") or {}
-            okey = f"{(ent.get('controllingFacility') or '').upper()}/{(ent.get('controllingSector') or '').upper()}"
-            posid = self.owner_to_position.get(okey) or self.fallback_position
-            if posid:
-                is_trainee = posid in self.trainee_positions
-                is_stars = bool((self._atc_meta.get(posid) or {}).get("isStars"))
-                if is_stars and not is_trainee:
-                    # STARS/TRACON can't InitiateControl an enroute-positioned
-                    # track (ILL TRK). It auto-tracks by destination airport — but
-                    # ONLY airports it controls (else vNAS errors "not controlled").
-                    # Aircraft going elsewhere (transiting) fall to the enroute
-                    # fallback instead.
-                    controlled = set((self._atc_meta.get(posid) or {}).get("airports") or [])
-                    apt = self._airport3(destination)
-                    if apt and apt in controlled:
-                        self._stars_airports.setdefault(posid, set()).add(apt)
-                    elif self.fallback_position:
-                        aircraft.auto_track_position_id = self.fallback_position
-                else:
-                    # Own the track with its sector's ghost. Handoffs then happen
-                    # NORMALLY — vNAS ghosts hand off to each other by airspace as
-                    # aircraft cross sectors, including to the trainee position's
-                    # ghost; the student signs into that position and receives them.
-                    # (No handoffDelay-to-student, which needs a student designated
-                    # in the scenario and otherwise errors "student must be specified".)
-                    aircraft.auto_track_position_id = posid
-                # Re-issue captured controller instructions (AI executes them) —
-                # NOT for the trainee's own sector, and only when AIRBORNE. A CM on
-                # a ground aircraft errors ("can not climb/descend on the ground"),
-                # and ground speed alone isn't enough (taxi/takeoff roll have speed
-                # but are still on the ground) — also require some altitude.
-                airborne = ground_speed >= 40 and spawn_alt >= 1500
-                on_arrival = bool((fp.get("star") or "").strip())
-                first = int(entry.get("firstSeenOffsetSec") or 0)
-                cmds: List[str] = []
-                if not is_trainee:
-                    timed: List[tuple] = []  # (offsetSec, command)
-                    # 1) Initial clearance at spawn (airborne only — a CM on the
-                    #    ground errors).
-                    if airborne:
-                        init_cmds, scratch = self._clearance_commands(
-                            entry.get("clearances") or {}, cruise_alt, on_arrival=on_arrival,
+            first = int(entry.get("firstSeenOffsetSec") or 0)
+            spawn_key = (
+                f"{(ent.get('controllingFacility') or '').upper()}/"
+                f"{(ent.get('controllingSector') or '').upper()}"
+            )
+            handoffs = sorted(
+                (h for h in (entry.get("handoffs") or []) if h.get("atOffsetSec") is not None),
+                key=lambda h: int(h["atOffsetSec"]),
+            )
+
+            # When (if ever) does a trainee sector take ownership, and who hands
+            # it over? student_handoff = (offsetSec, upstream_owner_key | None);
+            # a None upstream means the trainee already owns it at spawn.
+            student_handoff = None
+            if spawn_key in self.trainee_owner_keys:
+                student_handoff = (first, None)
+            else:
+                for h in handoffs:
+                    to_key = (
+                        f"{(h.get('toFacility') or '').upper()}/"
+                        f"{(h.get('toSector') or '').upper()}"
+                    )
+                    if to_key in self.trainee_owner_keys:
+                        student_handoff = (
+                            int(h["atOffsetSec"]),
+                            f"{(h.get('fromFacility') or '').upper()}/"
+                            f"{(h.get('fromSector') or '').upper()}",
                         )
-                        for c in init_cmds:
-                            timed.append((0, c))
-                        if scratch:
-                            aircraft.auto_track_scratchpad = scratch
-                    # 2) Timed clearance CHANGES (alt/speed/heading) at the times
-                    #    they happened — "all commands done as WAIT".
-                    for ev in (entry.get("clearanceEvents") or []):
-                        if ev.get("atOffsetSec") is None:
-                            continue
-                        c = self._event_command(ev)
-                        if c:
-                            timed.append((max(0, int(ev["atOffsetSec"]) - first), c))
-                    # 3) Full handoff chain, timed — to ANY facility (in-house,
-                    #    neighbor ARTCC, TRACON), targeting the next sector by its
-                    #    POSITION ID (universal; no adaptation codes). Each owning
-                    #    ghost flashes at the captured time; AI ghosts auto-accept,
-                    #    the trainee accepts the one to their sector. Only sectors
-                    #    we staffed (have a position) can be targeted.
-                    for h in (entry.get("handoffs") or []):
-                        if h.get("atOffsetSec") is None:
-                            continue
-                        to_key = f"{(h.get('toFacility') or '').upper()}/{(h.get('toSector') or '').upper()}"
-                        target = self.owner_to_position.get(to_key)
-                        if target:
-                            timed.append((max(0, int(h["atOffsetSec"]) - first), f"HO {target}"))
-                    # Emit in chronological order; t=0 immediate, rest as WAIT.
-                    timed.sort(key=lambda x: x[0])
-                    cmds = [c if t == 0 else f"WAIT {t} {c}" for t, c in timed]
-                if cmds:
-                    aircraft.preset_commands = cmds
+                        break
+
+            goes_to_student = student_handoff is not None
+            if goes_to_student and student_handoff[1] is None:
+                # Trainee already owns it — hand the seat (and the track) to the
+                # student at load.
+                if self.student_position_id:
+                    aircraft.auto_track_position_id = self.student_position_id
+            elif goes_to_student:
+                off, upstream_key = student_handoff
+                owner = self.owner_to_position.get(upstream_key) or self.fallback_position
+                if owner:
+                    aircraft.auto_track_position_id = owner
+                    # Flash to the student at the real handoff time (≥1s so it
+                    # actually flashes instead of spawning already owned).
+                    aircraft.auto_track_handoff_delay = max(1, off - first)
+            else:
+                # Background traffic the trainee never works — owned by its (ghost)
+                # sector the whole time for a realistic scope picture.
+                owner = self.owner_to_position.get(spawn_key) or self.fallback_position
+                if owner:
+                    aircraft.auto_track_position_id = owner
+
+            # Re-issue captured controller instructions so the AI flies the real
+            # climb/descent/speed profile — but NOT on aircraft bound for the
+            # student (those are the trainee's to work), and only when AIRBORNE (a
+            # CM on the ground errors). Timed changes replay as WAIT at their
+            # offset; ground speed alone isn't enough (taxi/takeoff roll have
+            # speed but are on the ground) so also require some altitude.
+            airborne = ground_speed >= 40 and spawn_alt >= 1500
+            on_arrival = bool((fp.get("star") or "").strip())
+            if not goes_to_student:
+                timed: List[tuple] = []  # (offsetSec, command)
+                if airborne:
+                    init_cmds, scratch = self._clearance_commands(
+                        entry.get("clearances") or {}, cruise_alt, on_arrival=on_arrival,
+                    )
+                    for c in init_cmds:
+                        timed.append((0, c))
+                    if scratch:
+                        aircraft.auto_track_scratchpad = scratch
+                for ev in (entry.get("clearanceEvents") or []):
+                    if ev.get("atOffsetSec") is None:
+                        continue
+                    c = self._event_command(ev)
+                    if c:
+                        timed.append((max(0, int(ev["atOffsetSec"]) - first), c))
+                timed.sort(key=lambda x: x[0])
+                if timed:
+                    aircraft.preset_commands = [
+                        c if t == 0 else f"WAIT {t} {c}" for t, c in timed
+                    ]
 
         return aircraft, None
 
@@ -386,13 +397,6 @@ class LiveReplayScenario:
             t = self._heading_token(val)
             return f"FH {t}" if t else None
         return None
-
-    @staticmethod
-    def _handoff_code(sector) -> str:
-        """ERAM handoff target code for a sector — e.g. sector 33 -> "T33"
-        (matches the `HO t33` form that works in CRC/ATCTrainer)."""
-        s = re.sub(r"[^0-9A-Za-z]", "", str(sector or "")).upper()
-        return f"T{s}" if s else ""
 
     @staticmethod
     def _airport3(icao) -> str:
