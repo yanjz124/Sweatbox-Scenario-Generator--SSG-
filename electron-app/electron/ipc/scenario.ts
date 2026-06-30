@@ -58,10 +58,11 @@ const STAGES: Array<{
   { re: /Generating (\d+) overflight aircraft/i, stage: 'gen_ovf', percent: 78, label: m => `Generating ${m[1]} overflights…` },
   { re: /Top-up pass (\d+)/i, stage: 'topup', percent: 85, label: m => `Top-up pass ${m[1]} — filling shortfall…` },
   { re: /Generation (?:met|shortfall)/i, stage: 'gen_done', percent: 92, label: () => 'Finalizing aircraft list…' },
+  { re: /Live replay produced (\d+) aircraft/i, stage: 'gen_done', percent: 90, label: m => `Built ${m[1]} aircraft from capture…` },
   { re: /Generated \d+ aircraft/i, stage: 'write', percent: 98, label: () => 'Writing scenario file…' },
 ];
 
-function resolveBridgeCommand(): { cmd: string; args: string[]; cwd: string } {
+export function resolveBridgeCommand(): { cmd: string; args: string[]; cwd: string } {
   if (app.isPackaged) {
     const exeName = process.platform === 'win32' ? 'ssg_bridge.exe' : 'ssg_bridge';
     const exe = path.join(process.resourcesPath, 'bridge', exeName);

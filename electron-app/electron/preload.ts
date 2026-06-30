@@ -3,6 +3,10 @@ import type {
   ScenarioConfig,
   ScenarioResult,
   VNASUploadResult,
+  SwimCredentialsInput,
+  SwimCredentialsStatus,
+  CaptureRequest,
+  CaptureResult,
 } from '../shared/types';
 
 interface ProgressEvent {
@@ -27,6 +31,41 @@ contextBridge.exposeInMainWorld('ssg', {
     openScenario: (): Promise<{ filename: string; contents: string } | null> =>
       ipcRenderer.invoke('fs:openScenario'),
     loadConfig: (): Promise<unknown> => ipcRenderer.invoke('fs:loadConfig'),
+    pickFile: (options?: { title?: string; extensions?: string[] }): Promise<string | null> =>
+      ipcRenderer.invoke('fs:pickFile', options),
+  },
+  liveCapture: {
+    saveCredentials: (creds: SwimCredentialsInput): Promise<{ status: string; message?: string }> =>
+      ipcRenderer.invoke('liveCapture:saveCredentials', creds),
+    loadCredentials: (): Promise<SwimCredentialsStatus | null> =>
+      ipcRenderer.invoke('liveCapture:loadCredentials'),
+    connect: (): Promise<{ status: string; connected?: boolean; flights?: number; message?: string }> =>
+      ipcRenderer.invoke('liveCapture:connect'),
+    disconnect: (): Promise<{ status: string; stopped?: boolean }> =>
+      ipcRenderer.invoke('liveCapture:disconnect'),
+    serverStatus: (): Promise<{ reachable: boolean; connected: boolean; flights: number; messages: number }> =>
+      ipcRenderer.invoke('liveCapture:serverStatus'),
+    getSectorGeometry: (facility: string) =>
+      ipcRenderer.invoke('liveCapture:getSectorGeometry', facility),
+    getPositions: (facility: string) => ipcRenderer.invoke('liveCapture:getPositions', facility),
+    getRouteSectors: (facility: string, captureFile: string) =>
+      ipcRenderer.invoke('liveCapture:getRouteSectors', facility, captureFile),
+    readCapture: (filePath: string) => ipcRenderer.invoke('liveCapture:readCapture', filePath),
+    writeCapture: (data: unknown) => ipcRenderer.invoke('liveCapture:writeCapture', data),
+    startCapture: (req: CaptureRequest): Promise<CaptureResult> =>
+      ipcRenderer.invoke('liveCapture:startCapture', req),
+    stopCapture: (): Promise<{ stopped: boolean }> =>
+      ipcRenderer.invoke('liveCapture:stopCapture'),
+    onProgress: (
+      cb: (ev: { elapsed: number; total: number; recorded: number; activeSectors: number; message: string }) => void,
+    ): (() => void) => {
+      const listener = (
+        _e: unknown,
+        data: { elapsed: number; total: number; recorded: number; activeSectors: number; message: string },
+      ) => cb(data);
+      ipcRenderer.on('liveCapture:progress', listener);
+      return () => ipcRenderer.removeListener('liveCapture:progress', listener);
+    },
   },
   airports: {
     list: () => ipcRenderer.invoke('airports:list'),

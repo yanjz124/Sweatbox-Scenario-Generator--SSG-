@@ -4,7 +4,12 @@ import * as fs from 'node:fs/promises';
 import { generateScenario } from './ipc/scenario';
 import { listAirports } from './ipc/airports';
 import { uploadScenario, resetVnasSession, clearVnasCookies } from './ipc/vnas';
-import type { ScenarioConfig } from '../shared/types';
+import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors } from './ipc/liveCapture';
+import type {
+  ScenarioConfig,
+  SwimCredentialsInput,
+  CaptureRequest,
+} from '../shared/types';
 
 const RELEASES_API =
   'https://api.github.com/repos/braukStauter/Sweatbox-Scenario-Generator--SSG-/releases/latest';
@@ -154,6 +159,50 @@ function registerIpc() {
     const contents = await fs.readFile(filePath, 'utf8');
     return { filename: path.basename(filePath), contents };
   });
+  ipcMain.handle('fs:pickFile', async (_e, options?: { title?: string; extensions?: string[] }) => {
+    const exts = options?.extensions && options.extensions.length > 0 ? options.extensions : ['*'];
+    const res = await dialog.showOpenDialog({
+      title: options?.title ?? 'Select a file',
+      filters: [{ name: 'Files', extensions: exts }, { name: 'All files', extensions: ['*'] }],
+      properties: ['openFile'],
+    });
+    if (res.canceled || !res.filePaths[0]) return null;
+    return res.filePaths[0];
+  });
+  ipcMain.handle('liveCapture:saveCredentials', (_e, creds: SwimCredentialsInput) =>
+    saveCredentials(creds),
+  );
+  ipcMain.handle('liveCapture:loadCredentials', () => loadCredentials());
+  ipcMain.handle('liveCapture:connect', () => connect());
+  ipcMain.handle('liveCapture:disconnect', () => disconnect());
+  ipcMain.handle('liveCapture:serverStatus', () => serverStatus());
+  ipcMain.handle('liveCapture:getSectorGeometry', (_e, facility: string) => getSectorGeometry(facility));
+  ipcMain.handle('liveCapture:getPositions', (_e, facility: string) => getPositions(facility));
+  ipcMain.handle('liveCapture:getRouteSectors', (_e, facility: string, captureFile: string) =>
+    getRouteSectors(facility, captureFile),
+  );
+  ipcMain.handle('liveCapture:readCapture', async (_e, filePath: string) => {
+    try {
+      return JSON.parse(await fs.readFile(filePath, 'utf8'));
+    } catch {
+      return null;
+    }
+  });
+  ipcMain.handle('liveCapture:writeCapture', async (_e, data: unknown) => {
+    const dir = path.join(app.getPath('userData'), 'captures');
+    await fs.mkdir(dir, { recursive: true });
+    const out = path.join(dir, `edited-${Date.now()}.capture.json`);
+    await fs.writeFile(out, JSON.stringify(data, null, 2), 'utf8');
+    return out;
+  });
+  ipcMain.handle('liveCapture:stopCapture', () => stopCapture());
+  ipcMain.handle('liveCapture:startCapture', (e, req: CaptureRequest) =>
+    startCapture(req, progress => {
+      if (!e.sender.isDestroyed()) {
+        e.sender.send('liveCapture:progress', progress);
+      }
+    }),
+  );
   ipcMain.handle('vnas:upload', (_e, contents: string) => uploadScenario(contents));
   ipcMain.handle('vnas:reset', () => resetVnasSession());
   ipcMain.handle('vnas:clearCookies', () => clearVnasCookies());
@@ -167,6 +216,11 @@ app.whenReady().then(() => {
   app.on('activate', () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow();
   });
+});
+
+app.on('before-quit', () => {
+  // Best-effort: stop the warm SwimServer so it doesn't linger after SSG exits.
+  disconnect().catch(() => {});
 });
 
 app.on('window-all-closed', () => {

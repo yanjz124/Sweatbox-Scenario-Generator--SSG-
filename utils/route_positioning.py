@@ -259,15 +259,14 @@ class RouteParser:
         # Calculate distance
         distance = self.calculate_distance(wp_lat, wp_lon, lat, lon)
 
-        # Format: WAYPOINT + radial (3 digits) + distance (2 digits)
-        # Round radial to nearest degree
+        # vNAS FRD format: WAYPOINT + radial (3 digits) + distance (3 digits),
+        # e.g. "HOMRR020003". Distance MUST be zero-padded to 3 digits — a
+        # 2-digit pad produced invalid FRDs like "RMG03159" for distances < 100,
+        # which vNAS rejects ("invalid FIX/FRD format").
         radial_int = int(round(radial)) % 360
-
-        # Round distance to nearest nautical mile
         distance_int = int(round(distance))
 
-        # Pad to ensure proper format
-        frd_string = f"{wp_name}{radial_int:03d}{distance_int:02d}"
+        frd_string = f"{wp_name}{radial_int:03d}{distance_int:03d}"
 
         logger.debug(f"Generated FRD: {frd_string} (from {wp_name} at {radial_int}° for {distance_int}nm)")
 
@@ -398,7 +397,7 @@ def parse_frd_string(frd: str) -> Optional[Dict]:
     """
     # FRD format: WAYPOINT + radial (3 digits) + distance (2 digits)
     # Example: BAYLR35010 = BAYLR, 350°, 10nm
-    match = re.match(r'^([A-Z]{3,5})(\d{3})(\d{2})$', frd.upper())
+    match = re.match(r'^([A-Z]{3,5})(\d{3})(\d{3})$', frd.upper())
 
     if not match:
         logger.warning(f"Invalid FRD format: {frd}")

@@ -14,5 +14,9 @@ undetected-chromedriver>=3.5.0
 selenium>=4.0.0  # Required by undetected-chromedriver and vNAS client
 setuptools>=70.0.0  # Required for undetected-chromedriver on Python 3.13+
 
+# Live SWIM sector capture (replay scenarios)
+keyring>=24.0.0  # Secure OS-keyring storage for SWIM credentials (falls back to file if absent)
+websocket-client>=1.7.0  # Consumes SwimServer's /ws live flight feed
+
 # Optional: for better performance with large JSON files
 # ujson>=5.8.0

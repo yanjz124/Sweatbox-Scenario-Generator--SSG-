@@ -13,11 +13,21 @@ const AIRPORT_TYPES: Array<{ id: ScenarioType; title: string; description: strin
 
 const ENROUTE_TYPES: Array<{ id: ScenarioType; title: string; description: string }> = [
   { id: 'enroute', title: 'Enroute (ARTCC)', description: 'ARTCC-wide enroute traffic.' },
+  {
+    id: 'live_replay',
+    title: 'Live Replay (SWIM)',
+    description:
+      'Capture live real-world traffic in a sector and replay it from real positions/altitudes.',
+  },
 ];
 
 export function ScenarioTypeSelection() {
   const { config, update, setScreen, setImportedScenario } = useScenarioStore();
-  const isEnroute = config.scenarioType === 'enroute';
+  // Both enroute and live-replay belong to the ARTCC (enroute) flow, so keep
+  // the enroute list shown when either is selected — otherwise picking
+  // live_replay would flip the list back to the airport types.
+  const isEnroute =
+    config.scenarioType === 'enroute' || config.scenarioType === 'live_replay';
   const list = isEnroute ? ENROUTE_TYPES : AIRPORT_TYPES;
 
   const chooseJson = async () => {
@@ -61,7 +71,13 @@ export function ScenarioTypeSelection() {
         <ThemedButton secondary onClick={() => setScreen('airport')}>← Back</ThemedButton>
         <div className="row" style={{ gap: 8 }}>
           <ThemedButton secondary onClick={chooseJson}>Choose JSON…</ThemedButton>
-          <ThemedButton onClick={() => setScreen('config')}>Next →</ThemedButton>
+          <ThemedButton
+            onClick={() =>
+              setScreen(config.scenarioType === 'live_replay' ? 'capture' : 'config')
+            }
+          >
+            Next →
+          </ThemedButton>
         </div>
       </div>
     </Card>

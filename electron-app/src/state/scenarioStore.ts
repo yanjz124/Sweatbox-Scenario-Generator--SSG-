@@ -2,7 +2,7 @@ import { create } from 'zustand';
 import type { ScenarioConfig, ScenarioResult } from '../../shared/types';
 import { defaultBias } from '../../shared/wakeBias';
 
-export type Screen = 'airport' | 'type' | 'config' | 'generation';
+export type Screen = 'airport' | 'type' | 'config' | 'capture' | 'edit' | 'generation';
 
 interface StoreState {
   screen: Screen;
@@ -56,6 +56,9 @@ function initialConfig(): ScenarioConfig {
       arrivals: { count: 0, mode: 'VFR' },
     },
     customBoundary: { enabled: false, waypoints: [] },
+    captureFile: undefined,
+    holdInitialAltitude: false,
+    scenarioName: undefined,
   };
 }
 

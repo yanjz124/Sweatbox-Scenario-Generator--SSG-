@@ -3,6 +3,8 @@ import { useScenarioStore } from './state/scenarioStore';
 import { AirportSelection } from './screens/AirportSelection';
 import { ScenarioTypeSelection } from './screens/ScenarioTypeSelection';
 import { ScenarioConfig } from './screens/ScenarioConfig';
+import { LiveCapture } from './screens/LiveCapture';
+import { LiveCaptureEdit } from './screens/LiveCaptureEdit';
 import { Generation } from './screens/Generation';
 import { SplashScreen } from './screens/SplashScreen';
 import { UpdateNotice } from './components/UpdateNotice';
@@ -19,6 +21,8 @@ export function App() {
       {screen === 'airport' && <AirportSelection />}
       {screen === 'type' && <ScenarioTypeSelection />}
       {screen === 'config' && <ScenarioConfig />}
+      {screen === 'capture' && <LiveCapture />}
+      {screen === 'edit' && <LiveCaptureEdit />}
       {screen === 'generation' && <Generation />}
     </div>
   );

@@ -25,10 +25,16 @@ extraResources:
     filter:
       - "*.geojson"
       - "FAACIFP18"
+      - "AllSectors.kml"
   - from: "../config.json"
     to: "config.json"
   - from: "../utils/artcc_boundaries.geojson"
     to: "artcc_boundaries.geojson"
+  # Self-contained SwimServer (live-replay SWIM feed). Built by
+  # scripts/build-swimserver.mjs into ../dist/swimserver/. The bridge resolves
+  # it via resource_path('swimserver', 'SwimServer.exe').
+  - from: "../dist/swimserver"
+    to: "swimserver"
 
 win:
   target:

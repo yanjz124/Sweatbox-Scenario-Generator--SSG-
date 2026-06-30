@@ -138,7 +138,10 @@ def resource_path(*parts):
     return REPO_ROOT.joinpath(*parts)
 
 from utils.api_client import FlightDataAPIClient  # noqa: E402
-from parsers.geojson_parser import GeoJSONParser  # noqa: E402
+# NOTE: GeoJSONParser is imported lazily inside load_parsers() — it transitively
+# pulls in FlightRadarAPI/selenium, which the live-replay capture/credentials
+# paths don't need. Keeping it out of module import lets those actions run in a
+# slimmer environment (and speeds bridge startup).
 from generators.vnas_json_exporter import VNASJSONExporter  # noqa: E402
 from utils.preset_command_processor import apply_preset_commands  # noqa: E402
 from utils.data_pipeline import split_counts, load_cifp_index  # noqa: E402
@@ -295,6 +298,7 @@ def difficulty_dict(d):
 
 
 def load_parsers(airport):
+    from parsers.geojson_parser import GeoJSONParser  # lazy: pulls FlightRadarAPI
     geojson_file = resource_path('airport_data', f'{airport}.geojson')
     if not geojson_file.exists():
         geojson_file = resource_path('airport_data', f'{airport.lstrip("K")}.geojson')
@@ -316,6 +320,24 @@ _LAST_GENERATION_STATS = None  # Optional[dict]
 
 
 def dispatch(cfg):
+    # --- Live Replay (SWIM sector capture) ---------------------------------
+    # Handled first: it reads a capture file rather than the live flight API,
+    # and has no departure airport (the identifier is the ARTCC facility).
+    if cfg.get('scenarioType') == 'live_replay':
+        from scenarios.live_replay import LiveReplayScenario
+        capture_file = cfg.get('captureFile')
+        if not capture_file:
+            raise ValueError("live_replay scenario requires a 'captureFile' path")
+        sc = LiveReplayScenario.from_file(
+            capture_file,
+            hold_initial_altitude=bool(cfg.get('holdInitialAltitude', False)),
+        )
+        aircraft = sc.generate()
+        globals()['_LAST_GENERATION_STATS'] = getattr(sc, 'generation_stats', None)
+        # Return the ARTCC facility as the identifier so the exporter uses the
+        # enroute (artccId) path rather than an airport code.
+        return aircraft, sc.facility
+
     airport = cfg['departureAirport']
     scenario_type = cfg['scenarioType']
     api = FlightDataAPIClient()
@@ -605,6 +627,301 @@ def dispatch(cfg):
     return aircraft, None
 
 
+def _action_save_credentials(cfg):
+    """Persist SFDPS credentials supplied by the GUI."""
+    from utils.live_capture import CredentialStore, SwimCredentials
+    store = CredentialStore()
+    creds = SwimCredentials(
+        user=cfg.get('user', '') or '',
+        password=cfg.get('password', '') or '',
+        queue=cfg.get('queue', '') or '',
+        host=cfg.get('host') or '',
+        vpn=cfg.get('vpn') or '',
+    )
+    # Blank password on save = "keep the existing one" (the UI never reloads the
+    # stored secret, so editing other fields must not wipe it).
+    if not creds.password:
+        creds.password = store.load().password
+    store.save(creds)
+    return {'status': 'ok'}
+
+
+def _action_load_credentials(cfg):
+    """Return stored SFDPS credentials (password presence only, never value)."""
+    from utils.live_capture import CredentialStore
+    c = CredentialStore().load()
+    return {
+        'status': 'ok',
+        'user': c.user, 'queue': c.queue, 'host': c.host, 'vpn': c.vpn,
+        'hasPassword': bool(c.password),
+        'isComplete': c.is_complete(),
+    }
+
+
+def _resolve_sector_kml(cfg):
+    """Path to the sector KML — caller-provided, else the bundled AllSectors.kml."""
+    if cfg.get('kml'):
+        return cfg['kml']
+    p = resource_path('airport_data', 'AllSectors.kml')
+    return str(p) if p.exists() else None
+
+
+def _action_capture(cfg, logger):
+    """Run a live capture (whole facility by default) and write a capture file."""
+    import time
+    from utils.live_capture import CredentialStore, SwimServerManager
+    from utils.live_capture.swim_ws import SwimCaptureClient
+
+    facility = (cfg.get('facility') or '').strip().upper()
+    sector = (cfg.get('sector') or '').strip()  # '' / 'ALL' => whole facility; else comma list
+    if not facility:
+        return {'status': 'error', 'message': 'capture requires a facility'}
+    facility_wide = (sector == '' or sector.upper() == 'ALL')
+    sector_list = [] if facility_wide else [s.strip() for s in sector.split(',') if s.strip()]
+
+    window = int(cfg.get('windowSeconds') or 1800)
+    warmup = int(cfg.get('warmupSeconds') or 0)
+    host = cfg.get('host') or 'localhost'
+    port = int(cfg.get('port') or 5001)
+
+    # Boundary geometry (fallback for flights with no ownership). Defaults to
+    # the bundled AllSectors.kml. Facility-wide uses every sector polygon.
+    boundary = None
+    boundary_name = None
+    kml = _resolve_sector_kml(cfg)
+    if kml:
+        from parsers.kml_parser import parse_sectors_kml
+        index = parse_sectors_kml(kml)
+        boundary_name = Path(kml).name
+        if facility_wide:
+            boundary = index.sectors_for(facility) or None
+        else:
+            boundary = [b for b in (index.get(facility, s) for s in sector_list) if b] or None
+            if boundary is None:
+                logger.warning(f"Sectors {sector_list} not in KML for {facility}; ownership-only membership")
+
+    # "End now" support: the GUI creates `stopFile` on disk; a watcher flips the
+    # stop_event so the capture loop (and warmup) exits early but still writes
+    # everything recorded so far (so the partial capture is still generatable).
+    import threading
+    stop_event = None
+    stop_file = cfg.get('stopFile')
+    if stop_file:
+        stop_event = threading.Event()
+        sf = Path(stop_file)
+
+        def _watch():
+            while not stop_event.is_set():
+                if sf.exists():
+                    logger.info("Stop requested (end now)")
+                    stop_event.set()
+                    break
+                time.sleep(0.5)
+
+        threading.Thread(target=_watch, daemon=True).start()
+
+    # Attach to the warm SwimServer (started by 'connect'). If none is running,
+    # start one detached so it stays warm; never stop it here — the user
+    # disconnects explicitly.
+    if cfg.get('startServer', True):
+        creds = CredentialStore().load()
+        manager = SwimServerManager(creds, host=host, port=port)
+        manager.start(reuse_existing=True, detached=True)
+        if not manager.wait_until_ready(timeout=90):
+            return {'status': 'error', 'message': 'SwimServer not reachable — click Connect first.'}
+        if warmup > 0:
+            logger.info(f"Warming up {warmup}s before capture window...")
+            for _ in range(warmup):
+                if stop_event is not None and stop_event.is_set():
+                    break
+                time.sleep(1)
+
+    client = SwimCaptureClient(
+        facility, sector or None, host=host, port=port,
+        boundary=boundary, boundary_kml_name=boundary_name,
+        vicinity_nm=float(cfg.get('vicinityNm') or 0),
+    )
+
+    def progress(elapsed, total, n, sectors):
+        # Parsed by the Electron capture IPC for the progress display.
+        logger.info(f"Capture progress: {int(elapsed)}/{int(total)}s recorded={n} sectors={sectors}")
+
+    try:
+        result = client.capture(window, progress_callback=progress, stop_event=stop_event)
+    finally:
+        if stop_file:
+            try:
+                Path(stop_file).unlink()
+            except OSError:
+                pass
+
+    out_dir = Path(cfg.get('outputDir') or (Path.home() / 'SSG' / 'captures'))
+    out_dir.mkdir(parents=True, exist_ok=True)
+    short = facility[1:] if facility.startswith('K') and len(facility) == 4 else facility
+    sec_label = 'ALL' if facility_wide else '-'.join(sector_list)
+    fname = out_dir / f"{short}_{sec_label}_{datetime.now().strftime('%d%H%M')}.capture.json"
+    result.write(fname)
+    return {
+        'status': 'ok',
+        'captureFile': str(fname),
+        'recorded': len(result.aircraft),
+        'diagnostics': result.diagnostics,
+    }
+
+
+def _action_route_sectors(cfg, logger):
+    """For each captured aircraft, compute which KML sectors its filed route
+    passes through (lateral + altitude band). Powers the editor's
+    'select by sector (flight-plan path)' tool. Returns {gufi: [sectorId,...]}."""
+    from parsers.kml_parser import parse_sectors_kml
+    from utils.route_positioning import RouteParser
+    facility = (cfg.get('facility') or '').strip().upper()
+    cap_path = cfg.get('captureFile')
+    if not facility or not cap_path:
+        return {'status': 'error', 'message': 'facility and captureFile required'}
+    try:
+        cap = json.loads(Path(cap_path).read_text('utf-8'))
+    except Exception as e:  # noqa: BLE001
+        return {'status': 'error', 'message': f'cannot read capture: {e}'}
+    kml = _resolve_sector_kml(cfg)
+    if not kml:
+        return {'status': 'error', 'message': 'no sector KML available'}
+    index = parse_sectors_kml(kml)
+    sectors = index.sectors_for(facility)
+    rp = RouteParser()
+
+    out = {}
+    for a in cap.get('aircraft', []):
+        fp = a.get('flightplan') or {}
+        route = fp.get('route') or ''
+        alt = fp.get('cruiseAltitudeFt')
+        coords = rp.get_route_waypoint_coordinates(rp.parse_route_string(route))
+        hit = set()
+        for (_nm, lat, lon) in coords:
+            for b in sectors:
+                if b.sector in hit:
+                    continue
+                if b.contains(lat, lon, alt):
+                    hit.add(b.sector)
+        out[a.get('gufi')] = sorted(hit)
+    return {'status': 'ok', 'routeSectors': out}
+
+
+def _action_get_positions(cfg, logger):
+    """Pull the facility's vNAS positions (public data-api). Each enroute
+    position has eramConfiguration.sectorId → maps to SWIM controllingSector.
+    Returns positions for the ARTCC + child facilities so the editor can map
+    sectors → positions (with combining + fallback)."""
+    import requests
+    facility = (cfg.get('facility') or '').strip().upper()
+    if not facility:
+        return {'status': 'error', 'message': 'facility required'}
+    try:
+        url = f"https://data-api.vnas.vatsim.net/api/artccs/{facility}"
+        data = requests.get(url, timeout=20).json()
+    except Exception as e:  # noqa: BLE001
+        return {'status': 'error', 'message': f'vNAS API error: {e}'}
+
+    positions = []
+
+    def walk(fac):
+        if not isinstance(fac, dict):
+            return
+        fac_name = fac.get('name')
+        for p in (fac.get('positions') or []):
+            sector_id = ((p.get('eramConfiguration') or {}) or {}).get('sectorId')
+            positions.append({
+                'id': p.get('id'),
+                'sectorId': sector_id,
+                'name': p.get('name'),
+                'callsign': p.get('callsign'),
+                'frequency': p.get('frequency'),
+                'facility': fac_name,
+            })
+        for c in (fac.get('childFacilities') or []):
+            walk(c)
+
+    walk(data.get('facility', {}))
+    return {'status': 'ok', 'facility': facility, 'positions': positions}
+
+
+def _action_get_sectors(cfg, logger):
+    """Return the polygon geometry for a facility's sectors (from the bundled
+    KML), for the in-app live scope. No SwimServer needed."""
+    from parsers.kml_parser import parse_sectors_kml
+    facility = (cfg.get('facility') or '').strip().upper()
+    if not facility:
+        return {'status': 'error', 'message': 'facility required'}
+    kml = _resolve_sector_kml(cfg)
+    if not kml:
+        return {'status': 'error', 'message': 'no sector KML available'}
+    index = parse_sectors_kml(kml)
+    out = []
+    for b in index.sectors_for(facility):
+        rings = [[[round(lon, 5), round(lat, 5)] for (lon, lat) in v.ring] for v in b.volumes]
+        out.append({
+            'sector': b.sector,
+            'designator': b.designator,
+            'stratum': b.stratum,
+            'floor': b.volumes[0].floor_ft if b.volumes else None,
+            'ceiling': b.volumes[0].ceiling_ft if b.volumes else None,
+            'rings': rings,
+        })
+    return {'status': 'ok', 'facility': facility, 'sectors': out}
+
+
+def _action_connect(cfg, logger):
+    """Start SwimServer with stored creds and KEEP IT WARM (detached). Confirms
+    the SWIM feed authenticates and data is flowing, then leaves the server
+    running so captures attach to a warm flight map. Stop it via 'disconnect'."""
+    import time
+    import requests
+    from utils.live_capture import CredentialStore, SwimServerManager
+
+    creds = CredentialStore().load()
+    if not creds.is_complete():
+        return {'status': 'error', 'message': 'SWIM credentials are incomplete (set user, password, queue).'}
+
+    host = cfg.get('host') or 'localhost'
+    port = int(cfg.get('port') or 5001)
+    manager = SwimServerManager(creds, host=host, port=port)
+    manager.start(reuse_existing=True, detached=True)  # stays warm; not stopped
+    if not manager.wait_until_ready(timeout=60):
+        return {'status': 'error', 'message': 'SwimServer did not start (check that the SwimServer build is present).'}
+
+    base = f"http://{host}:{port}"
+    connected = False
+    flights = 0
+    total = 0
+    deadline = time.monotonic() + 40
+    while time.monotonic() < deadline:
+        try:
+            s = requests.get(f"{base}/api/stats", timeout=5).json()
+            connected = bool(s.get('connected'))
+            flights = int(s.get('flights') or 0)
+            total = int(s.get('total') or 0)
+            if connected and total > 0:
+                break
+        except Exception:  # noqa: BLE001
+            pass
+        time.sleep(2)
+
+    if connected and total > 0:
+        return {'status': 'ok', 'connected': True, 'flights': flights, 'messages': total,
+                'message': f'Connected — warming up. {flights} flights, {total} messages.'}
+    if connected:
+        return {'status': 'ok', 'connected': True, 'flights': flights, 'messages': total,
+                'message': 'Connected — waiting for data (check the SFDPS queue if it stays at 0).'}
+    return {'status': 'error', 'connected': False,
+            'message': 'Could not authenticate to SWIM — check username/password/queue.'}
+
+
+def _action_disconnect(cfg, logger):
+    """Stop the warm SwimServer started by 'connect'."""
+    from utils.live_capture import stop_persistent
+    return {'status': 'ok', 'stopped': stop_persistent()}
+
+
 def main(config_path):
     log_path = _configure_logging()
     logger = logging.getLogger('ssg_bridge')
@@ -612,6 +929,35 @@ def main(config_path):
     logger.info(f"Config: {config_path}")
 
     cfg = json.loads(Path(config_path).read_text('utf-8'))
+
+    # Non-generation actions for the live-replay capture feature. These reuse
+    # the same single bridge exe (no separate Python interpreter at runtime).
+    action = cfg.get('action', 'generate')
+    if action == 'save_credentials':
+        print(json.dumps(_action_save_credentials(cfg)))
+        return
+    if action == 'load_credentials':
+        print(json.dumps(_action_load_credentials(cfg)))
+        return
+    if action == 'capture':
+        print(json.dumps(_action_capture(cfg, logger)))
+        return
+    if action in ('connect', 'test_credentials'):
+        print(json.dumps(_action_connect(cfg, logger)))
+        return
+    if action == 'disconnect':
+        print(json.dumps(_action_disconnect(cfg, logger)))
+        return
+    if action == 'get_sectors':
+        print(json.dumps(_action_get_sectors(cfg, logger)))
+        return
+    if action == 'get_positions':
+        print(json.dumps(_action_get_positions(cfg, logger)))
+        return
+    if action == 'route_sectors':
+        print(json.dumps(_action_route_sectors(cfg, logger)))
+        return
+
     aircraft, artcc_id = dispatch(cfg)
 
     preset_rules = [
@@ -631,9 +977,9 @@ def main(config_path):
 
     filename = VNASJSONExporter.export(
         aircraft,
-        cfg['departureAirport'],
+        cfg.get('departureAirport'),
         artcc_id,
-        cfg['scenarioType'],
+        cfg.get('scenarioName') or cfg['scenarioType'],
         str(out_dir),
     )
     logger.info(f"Generated {len(aircraft)} aircraft -> {filename}")

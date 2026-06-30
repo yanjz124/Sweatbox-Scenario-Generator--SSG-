@@ -23,7 +23,8 @@ export type ScenarioType =
   | 'tower_mixed'
   | 'tracon_arrivals'
   | 'tracon_mixed'
-  | 'enroute';
+  | 'enroute'
+  | 'live_replay';
 
 export type SpawnDelayMode = 'none' | 'incremental' | 'total';
 
@@ -175,6 +176,168 @@ export interface ScenarioConfig {
     enabled: boolean;
     waypoints: string[];
   };
+
+  /** Live-replay only: path to the capture file produced by the capture flow.
+   *  Set by the LiveCapture screen; consumed by the Python bridge's
+   *  `live_replay` scenario type. */
+  captureFile?: string;
+  /** Live-replay only: pin each aircraft to its captured altitude when run
+   *  uninterrupted (vs. following the filed climb/descent profile). */
+  holdInitialAltitude?: boolean;
+  /** Optional custom scenario name (used as the vNAS scenario title). */
+  scenarioName?: string;
+}
+
+/** SFDPS credentials the user enters once so SSG can launch SwimServer. The
+ *  password is write-only from the UI's perspective — load never returns it,
+ *  only `hasPassword`. */
+export interface SwimCredentialsInput {
+  user: string;
+  password: string;
+  queue: string;
+  host?: string;
+  vpn?: string;
+}
+
+export interface SwimCredentialsStatus {
+  user: string;
+  queue: string;
+  host: string;
+  vpn: string;
+  hasPassword: boolean;
+  isComplete: boolean;
+}
+
+export interface CaptureRequest {
+  facility: string;
+  /** Blank or "ALL" = capture every sector in the facility. */
+  sector?: string;
+  windowSeconds: number;
+  warmupSeconds: number;
+  kml?: string;
+  startServer?: boolean;
+  /** Also capture non-owned traffic within this many NM of the sector(s). 0 = off. */
+  vicinityNm?: number;
+}
+
+export interface CaptureResult {
+  status: 'ok' | 'error';
+  message?: string;
+  captureFile?: string;
+  recorded?: number;
+  diagnostics?: {
+    recorded?: number;
+    skippedNoRoute?: number;
+    skippedNoPosition?: number;
+    activeSectorCount?: number;
+    activeSectors?: string[];
+    recordedBySector?: Record<string, number>;
+    seenSectorsTop?: Record<string, number>;
+  };
+}
+
+export interface CredentialTestResult {
+  status: string;
+  connected?: boolean;
+  flights?: number;
+  message?: string;
+}
+
+export interface SectorGeometry {
+  sector: string;
+  designator?: string;
+  stratum?: string;
+  floor?: number | null;
+  ceiling?: number | null;
+  /** [ring][point][lon, lat] */
+  rings: number[][][];
+}
+
+export interface SectorGeometryResult {
+  status: string;
+  facility?: string;
+  sectors?: SectorGeometry[];
+  message?: string;
+}
+
+export interface VnasPosition {
+  id: string;
+  sectorId: string | null;
+  name: string | null;
+  callsign: string | null;
+  frequency: number | null;
+  facility: string | null;
+}
+
+export interface VnasPositionsResult {
+  status: string;
+  facility?: string;
+  positions?: VnasPosition[];
+  message?: string;
+}
+
+export interface AtcConfig {
+  enabled: boolean;
+  /** normalized sector id → vNAS position id (many sectors may share one). */
+  sectorToPosition: Record<string, string>;
+  fallbackPositionId?: string | null;
+  /** Set each aircraft's handoffDelay from its captured handoff timeline. */
+  handoffFromTimeline?: boolean;
+  /** Positions the trainee works — auto-handoff (in/out) is disabled for
+   *  aircraft owned by these, so the trainee does their own handoffs. The full
+   *  capture data is preserved, so the same capture can target other sectors. */
+  traineePositionIds?: string[];
+}
+
+export interface CaptureAircraft {
+  gufi: string;
+  callsign: string;
+  firstSeenOffsetSec: number;
+  membershipBasis?: string;
+  category?: 'sector' | 'vicinity';
+  aircraftType?: string | null;
+  wake?: string | null;
+  flightRules?: string | null;
+  spawn: {
+    lat: number | null;
+    lon: number | null;
+    altitudeFt: number | null;
+    groundSpeedKt: number | null;
+  };
+  flightplan: {
+    departure?: string | null;
+    destination?: string | null;
+    route?: string | null;
+    star?: string | null;
+    cruiseAltitudeFt?: number | null;
+    assignedAltitudeFt?: number | null;
+    cruiseSpeedKt?: number | null;
+    remarks?: string | null;
+    equipment?: string | null;
+  };
+  entry?: { controllingFacility?: string | null; controllingSector?: string | null };
+  /** Observed ownership/handoff timeline during the capture window. */
+  handoffs?: Array<{
+    atOffsetSec: number;
+    fromFacility?: string | null;
+    fromSector?: string | null;
+    toFacility?: string | null;
+    toSector?: string | null;
+  }>;
+  /** Editor-only: whether to include this aircraft in the generated scenario. */
+  include?: boolean;
+}
+
+export interface CaptureFile {
+  version?: number;
+  facility?: string;
+  sector?: string;
+  captureStart?: string;
+  windowSeconds?: number;
+  aircraft: CaptureAircraft[];
+  /** Editor-set ATC mapping consumed by the live_replay generator. */
+  atcConfig?: AtcConfig;
+  [k: string]: unknown;
 }
 
 export interface GenerationStats {
@@ -234,6 +397,36 @@ declare global {
         saveScenario(filename: string, contents: string): Promise<string>;
         openScenario(): Promise<{ filename: string; contents: string } | null>;
         loadConfig(): Promise<SsgConfig | null>;
+        pickFile(options?: {
+          title?: string;
+          extensions?: string[];
+        }): Promise<string | null>;
+      };
+      liveCapture: {
+        saveCredentials(creds: SwimCredentialsInput): Promise<{ status: string; message?: string }>;
+        loadCredentials(): Promise<SwimCredentialsStatus | null>;
+        connect(): Promise<CredentialTestResult>;
+        disconnect(): Promise<{ status: string; stopped?: boolean }>;
+        serverStatus(): Promise<{ reachable: boolean; connected: boolean; flights: number; messages: number }>;
+        getSectorGeometry(facility: string): Promise<SectorGeometryResult>;
+        getPositions(facility: string): Promise<VnasPositionsResult>;
+        getRouteSectors(
+          facility: string,
+          captureFile: string,
+        ): Promise<{ status: string; routeSectors?: Record<string, string[]>; message?: string }>;
+        readCapture(filePath: string): Promise<CaptureFile | null>;
+        writeCapture(data: CaptureFile): Promise<string>;
+        startCapture(req: CaptureRequest): Promise<CaptureResult>;
+        stopCapture(): Promise<{ stopped: boolean }>;
+        onProgress(
+          cb: (ev: {
+            elapsed: number;
+            total: number;
+            recorded: number;
+            activeSectors: number;
+            message: string;
+          }) => void,
+        ): () => void;
       };
       airports: {
         list(): Promise<Array<{ icao: string; filename: string }>>;
