@@ -1,0 +1,104 @@
+name: Build Release (fork)
+
+# Builds the Windows installer for the live-SWIM fork.
+#   • Push a tag like v2.2.0-swim.1  → builds + attaches the installer to a GitHub Release.
+#   • Manual "Run workflow"          → builds + uploads the installer as an artifact.
+#
+# SwimServer (the SwimReader project) is a separate repo, so its build is OPT-IN:
+#   set repo variable  SWIMREADER_REPO = <owner>/SwimReader
+#   set repo secret    SWIMREADER_PAT  = a PAT with read access to that repo
+# Without them the installer is built WITHOUT SwimServer (add SwimServer.exe to
+# resources/swimserver/ yourself, or set SSG_SWIMSERVER_EXE at runtime).
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write   # create releases / upload assets
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ── Python bridge (ssg_bridge.exe) ─────────────────────────────────────
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Python deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pyinstaller
+          # airport_utils imports the lowercase `flightradar24` module
+          pip install flightradar24 || echo "flightradar24 optional; airport scenarios may need it"
+
+      - name: Build bridge (PyInstaller)
+        run: python -m PyInstaller ssg_bridge.spec --clean --noconfirm
+
+      # ── SwimServer (optional, from the SwimReader repo) ────────────────────
+      - name: Setup .NET
+        if: ${{ vars.SWIMREADER_REPO != '' }}
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '8.0.x'
+
+      - name: Checkout SwimReader
+        if: ${{ vars.SWIMREADER_REPO != '' }}
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ vars.SWIMREADER_REPO }}
+          token: ${{ secrets.SWIMREADER_PAT }}
+          path: SwimReader
+
+      - name: Build SwimServer
+        if: ${{ vars.SWIMREADER_REPO != '' }}
+        env:
+          SWIMREADER_ROOT: ${{ github.workspace }}/SwimReader
+        run: node electron-app/scripts/build-swimserver.mjs
+
+      - name: Ensure swimserver dir exists
+        shell: pwsh
+        run: |
+          $d = "dist/swimserver"
+          if (-not (Test-Path "$d/SwimServer.exe")) {
+            New-Item -ItemType Directory -Force -Path $d | Out-Null
+            "SwimServer.exe was not bundled (SwimReader source not configured in CI). Add it here or set SSG_SWIMSERVER_EXE." | Out-File -Encoding utf8 "$d/NOTICE.txt"
+          }
+
+      # ── Renderer + Electron + installer ────────────────────────────────────
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install + build front-end
+        working-directory: electron-app
+        run: |
+          npm ci
+          npm run build
+
+      - name: Package installer (electron-builder)
+        working-directory: electron-app
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: npx electron-builder --win --publish never
+
+      - name: Upload installer artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ssg-installer
+          path: electron-app/release/*.exe
+
+      - name: Attach to GitHub Release (on tag)
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: electron-app/release/*.exe
+          generate_release_notes: true

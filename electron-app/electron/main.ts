@@ -11,10 +11,12 @@ import type {
   CaptureRequest,
 } from '../shared/types';
 
+// Fork build: track releases from the fork (yanjz124), not upstream, so the
+// updater doesn't offer to "downgrade" to the upstream version.
 const RELEASES_API =
-  'https://api.github.com/repos/braukStauter/Sweatbox-Scenario-Generator--SSG-/releases/latest';
+  'https://api.github.com/repos/yanjz124/Sweatbox-Scenario-Generator--SSG-/releases/latest';
 const RELEASES_HTML =
-  'https://github.com/braukStauter/Sweatbox-Scenario-Generator--SSG-/releases/latest';
+  'https://github.com/yanjz124/Sweatbox-Scenario-Generator--SSG-/releases/latest';
 
 function compareSemver(a: string, b: string): number {
   const parts = (s: string) =>
