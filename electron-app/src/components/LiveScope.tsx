@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react';
 import type { SectorGeometry } from '../../shared/types';
+import { useSvgPanZoom } from '../hooks/useSvgPanZoom';
 
 /** Normalize a sector id the same way the Python side does: uppercase, drop
  *  non-alphanumerics, strip leading zeros (so 7 == 07). */
@@ -51,6 +52,7 @@ export function LiveScope({
   const [tracks, setTracks] = useState<Track[]>([]);
   const [err, setErr] = useState<string | null>(null);
   const tracksRef = useRef<Map<string, Track>>(new Map());
+  const pz = useSvgPanZoom(W, H);
 
   const fac = facility.trim().toUpperCase();
   const selected = new Set(sectorList.map(normSector));
@@ -177,11 +179,16 @@ export function LiveScope({
 
   return (
     <div className="row" style={{ gap: 12, alignItems: 'flex-start', flexWrap: 'wrap' }}>
-      <div style={{ flex: '1 1 640px' }}>
+      <div style={{ flex: '1 1 640px', position: 'relative' }}>
+        <span style={{ position: 'absolute', top: 4, right: 8, fontSize: 10, color: 'var(--fg-secondary)', pointerEvents: 'none' }}>
+          scroll to zoom · drag to pan · double-click to reset
+        </span>
         <svg
+          ref={pz.ref}
           width="100%"
-          viewBox={`0 0 ${W} ${H}`}
-          style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)' }}
+          viewBox={pz.viewBox}
+          {...pz.panHandlers}
+          style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', cursor: 'grab', touchAction: 'none' }}
         >
           {/* sector polygons */}
           {geometry.map((s, si) =>

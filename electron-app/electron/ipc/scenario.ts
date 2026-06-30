@@ -138,7 +138,7 @@ export async function generateScenario(
   const outputDir = path.join(app.getPath('userData'), 'scenarios');
   await fs.mkdir(outputDir, { recursive: true });
   const payload = { ...config, outputDir };
-  const tmpFile = path.join(os.tmpdir(), `ssg-cfg-${Date.now()}.json`);
+  const tmpFile = path.join(os.tmpdir(), `ssg-cfg-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
   await fs.writeFile(tmpFile, JSON.stringify(payload, null, 2), 'utf8');
 
   try {

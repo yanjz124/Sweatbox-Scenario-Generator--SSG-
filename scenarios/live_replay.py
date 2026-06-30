@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import math
+import re
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -66,7 +67,7 @@ def _icao_airport(code) -> str:
     four letters). 3-letter US codes get a 'K' prefix; anything with digits or
     the wrong length (FAA LIDs like 60J/4B6, fixes, DMEs) is dropped to '' —
     data-admin refuses to save a scenario containing a non-airport endpoint."""
-    c = (code or "").strip().upper()
+    c = (code or "").strip().upper().split("/")[0]  # drop SWIM /TIME suffix (KDAL/1945)
     if len(c) == 3 and c.isalpha():
         c = "K" + c
     return c if (len(c) == 4 and c.isalpha()) else ""
@@ -101,6 +102,11 @@ class LiveReplayScenario:
         # pseudo controller IS still spawned for them so their tracks are owned
         # at load — vNAS hands the seat to the trainee when they connect.
         self.trainee_positions = set(atc.get("traineePositionIds") or [])
+        # Owner keys ("FAC/SEC") whose mapped position is a trainee seat — used to
+        # detect which captured handoffs go TO the trainee (→ flash to student).
+        self.trainee_owner_keys = {
+            k for k, v in self.owner_to_position.items() if v in self.trainee_positions
+        }
         # positionId -> {facilityId, artccId} metadata from the editor (facility
         # differs for center / TRACON / neighbor-ARTCC positions). The roster
         # itself is derived from the ACTUAL aircraft assignments in generate(),
@@ -136,11 +142,19 @@ class LiveReplayScenario:
     def generate(self) -> List[Aircraft]:
         entries = self.capture.get("aircraft", [])
         aircraft: List[Aircraft] = []
-        skipped = {"no_position": 0, "no_route": 0, "no_frd": 0, "no_type": 0}
+        skipped = {"no_position": 0, "no_route": 0, "no_frd": 0, "no_type": 0, "dup_callsign": 0}
 
+        # vNAS keys aircraft by callsign (AID) and rejects duplicates ("DUPLICATE
+        # AID"). Keep the first occurrence (entries are ordered by first-seen).
+        seen_callsigns: set = set()
         for entry in entries:
             ac, reason = self._aircraft_from_entry(entry)
             if ac is not None:
+                cs = (ac.callsign or "").strip().upper()
+                if cs in seen_callsigns:
+                    skipped["dup_callsign"] += 1
+                    continue
+                seen_callsigns.add(cs)
                 aircraft.append(ac)
             elif reason in skipped:
                 skipped[reason] += 1
@@ -181,7 +195,18 @@ class LiveReplayScenario:
         if lat is None or lon is None:
             return None, "no_position"
 
-        route_str = (fp.get("route") or "").strip()
+        # Prefer the route that keeps procedure names (SID/STAR/airways) over the
+        # one expanded to bare fixes — the filed originalRoute usually wins, but
+        # not always, so pick the one with fewer ".." direct-to segments.
+        route_active = (fp.get("route") or "").strip()
+        route_filed = (fp.get("originalRoute") or "").strip()
+        if route_filed and (not route_active or route_filed.count("..") < route_active.count("..")):
+            route_str = route_filed
+        else:
+            route_str = route_active
+        # SWIM annotates tokens with "/TIME" or "/speed-alt" (e.g. "KDAL/1945",
+        # "FIX/N0450F350") — strip them so route fixes + the destination parse.
+        route_str = re.sub(r"/\S+", "", route_str).strip()
         if not route_str:
             return None, "no_route"
 
@@ -249,7 +274,8 @@ class LiveReplayScenario:
             flight_rules=flight_rules,
             wake_turbulence=entry.get("wake"),
             star=fp.get("star"),
-            remarks=fp.get("remarks"),
+            # SWIM prefixes remarks with a "|" field separator — strip it.
+            remarks=((fp.get("remarks") or "").lstrip("| ").strip() or None),
             spawn_delay=spawn_delay,
             difficulty="Easy",
         )
@@ -265,12 +291,21 @@ class LiveReplayScenario:
                 is_trainee = posid in self.trainee_positions
                 # Auto-handoff timing from the captured timeline — but NOT for
                 # the trainee's own positions (they handle their handoffs).
-                if self.atc_handoff_from_timeline and not is_trainee:
-                    hos = entry.get("handoffs") or []
-                    if hos and hos[0].get("atOffsetSec") is not None:
-                        delay = int(hos[0]["atOffsetSec"]) - int(entry.get("firstSeenOffsetSec") or 0)
-                        if delay > 0:
-                            aircraft.auto_track_handoff_delay = delay
+                # Hand off to the student (trainee) ONLY for aircraft the capture
+                # actually handed to the trainee's sector — at the captured time.
+                # autoTrackConditions.handoffDelay hands to the student, so setting
+                # it only on trainee-bound traffic gives the realistic "inbound
+                # flashes to you" flow without flooding (or erroring on) every ac.
+                if (self.atc_handoff_from_timeline and not is_trainee
+                        and self.trainee_owner_keys):
+                    first = int(entry.get("firstSeenOffsetSec") or 0)
+                    for h in (entry.get("handoffs") or []):
+                        tk = f"{(h.get('toFacility') or '').upper()}/{(h.get('toSector') or '').upper()}"
+                        if tk in self.trainee_owner_keys and h.get("atOffsetSec") is not None:
+                            delay = int(h["atOffsetSec"]) - first
+                            if delay > 0:
+                                aircraft.auto_track_handoff_delay = delay
+                            break
                 # Re-issue the captured controller instructions via the fake ATC
                 # so the AI pilots execute them — but NEVER for the trainee's own
                 # sector (the trainee gives those clearances themselves).
@@ -294,9 +329,13 @@ class LiveReplayScenario:
         import re
         cmds: List[str] = []
 
-        # Altitude. Arrivals on a STAR get DVIA (descend via the arrival, honoring
-        # its crossing restrictions), optionally bottoming at the assigned/interim
-        # altitude. Everyone else gets a plain CM to a captured interim level-off.
+        # Altitude command (= the aircraft's command/assigned altitude at spawn):
+        #  • arrivals on a STAR → DVIA (descend via, honoring crossing restrictions),
+        #    bottoming at the captured interim/assigned altitude if any;
+        #  • a captured interim/temp altitude → CM to that level-off;
+        #  • otherwise → CM to the filed CRUISE (requested) altitude, so traffic
+        #    captured mid-climb/descent continues to its filed altitude instead of
+        #    stalling at the spawn altitude.
         interim = _to_int(clr.get("interimAltitudeFt"))
         assigned = _to_int(clr.get("assignedAltitudeFt"))
         if on_arrival:
@@ -304,6 +343,8 @@ class LiveReplayScenario:
             cmds.append(f"DVIA {self._alt_token(target)}" if target else "DVIA")
         elif interim and interim != (cruise_alt or 0):
             cmds.append(f"CM {self._alt_token(interim)}")
+        elif cruise_alt:
+            cmds.append(f"CM {self._alt_token(cruise_alt)}")
 
         # Speed vs Mach (SWIM gives e.g. "250", "S250", "M81", ".79").
         sp = self._speed_command(clr.get("speed"))
@@ -315,8 +356,12 @@ class LiveReplayScenario:
         if hdg:
             cmds.append(f"FH {hdg}")
 
-        scratch = (clr.get("fourthLine") or clr.get("text") or "")
-        scratch = re.sub(r"\s+", " ", str(scratch)).strip() or None
+        # Scratchpad from the 4th line — but vNAS re-applies it as an ERAM entry,
+        # so skip deviation / "/"-delimited speed-alt formats (they trigger a bad
+        # QS speed command, e.g. "DR/F").
+        scratch = re.sub(r"\s+", " ", str(clr.get("fourthLine") or clr.get("text") or "")).strip()
+        if not scratch or "/" in scratch or scratch.upper().startswith("DR"):
+            scratch = None
         return cmds, scratch
 
     @staticmethod
@@ -327,18 +372,16 @@ class LiveReplayScenario:
 
     @staticmethod
     def _speed_command(raw) -> Optional[str]:
+        """vNAS speed clearances are: Sxxx (IAS), xxx+/- (IAS at/above/below),
+        or Mxx+/- (Mach). Anything else (e.g. "DR/F" deviation) is NOT a speed —
+        it's free 4th-line text and is ignored here."""
         import re
         s = str(raw or "").upper().strip()
-        if not s:
+        m = re.match(r"^([SM]?)(\d{2,4})[+-]?$", s)
+        if not m:
             return None
-        digits = re.sub(r"\D", "", s)
-        if not digits:
-            return None
-        n = int(digits)
-        # Mach if flagged with M/'.', or a bare 2-digit value (.74 == "74").
-        if "M" in s or s.startswith(".") or n < 100:
-            return f"MACH {n}"
-        return f"SPD {n}"
+        prefix, num = m.group(1), int(m.group(2))
+        return f"MACH {num}" if prefix == "M" else f"SPD {num}"
 
     @staticmethod
     def _heading_token(raw) -> Optional[str]:
@@ -346,7 +389,10 @@ class LiveReplayScenario:
         digits = re.sub(r"\D", "", str(raw or ""))
         if not digits:
             return None
-        return f"{int(digits) % 360:03d}"
+        n = int(digits) % 360
+        if n == 0:
+            n = 360  # vNAS rejects "000"; north is 360
+        return f"{n:03d}"
 
     # ── helpers ─────────────────────────────────────────────────────────────────
     @staticmethod

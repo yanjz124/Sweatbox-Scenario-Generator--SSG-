@@ -2,6 +2,7 @@ import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useScenarioStore } from '../state/scenarioStore';
 import { Card, Section, ThemedButton, ThemedInput } from '../components/Themed';
+import { useSvgPanZoom } from '../hooks/useSvgPanZoom';
 import type { CaptureFile, CaptureAircraft, SectorGeometry, VnasPosition } from '../../shared/types';
 
 const W = 560;
@@ -31,7 +32,7 @@ export function LiveCaptureEdit() {
 
   const [ownerSel, setOwnerSel] = useState<Set<string>>(new Set());
   const [routeSel, setRouteSel] = useState<Set<string>>(new Set());
-  const [randomPct, setRandomPct] = useState(0);
+  const [keepPct, setKeepPct] = useState(100);
 
   const [atcEnabled, setAtcEnabled] = useState(true);
   // key = ownerKey ("FAC/SEC") -> vNAS position id
@@ -98,9 +99,36 @@ export function LiveCaptureEdit() {
     return m;
   }, [aircraft]);
   const activeOwners = useMemo(
-    () => Array.from(countByOwner.keys()).sort((a, b) => (countByOwner.get(b) || 0) - (countByOwner.get(a) || 0)),
+    () => Array.from(countByOwner.keys()).sort((a, b) => {
+      const [fa, sa] = a.split('/');
+      const [fb, sb] = b.split('/');
+      if (fa !== fb) return fa.localeCompare(fb);            // facility A→Z
+      const na = parseInt(sa, 10), nb = parseInt(sb, 10);    // then sector #
+      if (!isNaN(na) && !isNaN(nb) && na !== nb) return na - nb;
+      return sa.localeCompare(sb);
+    }),
     [countByOwner],
   );
+  // Facility display order: home ARTCC first, then other Z-centers, then
+  // TRACONs / everything else — each alphabetical within its tier.
+  const facRank = (f: string) => {
+    const home = (cap?.facility || '').toUpperCase();
+    return f === home ? 0 : /^Z/.test(f) ? 1 : 2;
+  };
+  const byFacility = (entries: [string, string[]][]) =>
+    entries.sort((a, b) => facRank(a[0]) - facRank(b[0]) || a[0].localeCompare(b[0]));
+
+  // Owners grouped by facility (home/Z-centers first) for a categorized UI.
+  const ownersByFacility = useMemo(() => {
+    const m = new Map<string, string[]>();
+    for (const k of activeOwners) {
+      const fac = k.split('/')[0] || '?';
+      if (!m.has(fac)) m.set(fac, []);
+      m.get(fac)!.push(k);
+    }
+    return byFacility(Array.from(m.entries()));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeOwners, cap?.facility]);
   const routeUniverse = useMemo(() => Array.from(new Set(Object.values(routeSectors).flat())).sort(), [routeSectors]);
 
   // Auto-match owners → positions whenever the (full) position set lands. Runs
@@ -115,6 +143,11 @@ export function LiveCaptureEdit() {
       for (const k of activeOwners) {
         if (next[k]) continue;
         const [f, s] = k.split('/');
+        // ERAM enroute only: match the ARTCC sector by eram sectorId. TRACON
+        // owners are deliberately left for the (enroute) fallback — a STARS
+        // position can't take control of an enroute-positioned replay track
+        // (vNAS rejects it with "ILL TRK"), so terminal traffic is owned by an
+        // ERAM ghost instead.
         const m = positions.find(pp => pp.artcc === f && pp.sectorId && normSec(pp.sectorId) === normSec(s));
         const id = m ? m.id : '';
         if (next[k] !== id) { next[k] = id; changed = true; }
@@ -123,23 +156,22 @@ export function LiveCaptureEdit() {
     });
   }, [positions, activeOwners]);
 
-  // Default the fallback to the busiest owner's mapped position (top of the
-  // owner list) so any owner that can't be matched (TRACON / unloaded ARTCC)
-  // still has a real working position to flash to — no track loads unowned.
+  // Default the fallback to the TOP position of the target facility's vNAS list
+  // (the primary/combined sector) — but ONLY until the user touches it, so they
+  // can deliberately set it to "none" without it snapping back.
+  const fallbackTouchedRef = useRef(false);
   useEffect(() => {
-    if (fallbackPos || positions.length === 0) return;
-    for (const k of activeOwners) {
-      const pid = ownerToPosition[k];
-      if (pid) { setFallbackPos(pid); break; }
-    }
-  }, [positions, activeOwners, ownerToPosition, fallbackPos]);
+    if (fallbackTouchedRef.current || fallbackPos || positions.length === 0) return;
+    const top = positions.find(p => !p.isNeighbor) || positions[0];
+    if (top) setFallbackPos(top.id);
+  }, [positions, fallbackPos]);
 
   // ── position picker: one shared datalist for all 1000+ positions (efficient
   // + searchable). label is unique so we can resolve label → id. ──
   const labelToId = useMemo(() => {
     const m = new Map<string, string>();
     for (const p of positions) {
-      let l = `${p.callsign || p.name || p.id} — ${p.facility ?? ''}${p.sectorId ? ` [${p.sectorId}]` : ''}`;
+      let l = `${p.facilityId || p.facility || ''}${p.sectorId ? `/${p.sectorId}` : ''} ${p.name || p.callsign || p.id}`;
       while (m.has(l)) l += ' ·';
       m.set(l, p.id);
     }
@@ -154,7 +186,12 @@ export function LiveCaptureEdit() {
   const artccCount = useMemo(() => new Set(positions.map(p => p.artcc).filter(Boolean)).size, [positions]);
   const posLabel = (id: string) => {
     const p = posById(id);
-    return p ? `${p.callsign || p.name || id}${p.facility ? ` — ${p.facility}` : ''}` : id;
+    if (!p) return id;
+    // Lead with facilityId/sector (ZTL etc. don't encode the sector in the
+    // callsign), then the friendly sector NAME (e.g. "Leeon 55"), not the raw
+    // callsign / ARTCC name.
+    const f = p.facilityId || p.facility || '';
+    return `${f}${p.sectorId ? `/${p.sectorId}` : ''} ${p.name || p.callsign || id}`.trim();
   };
   // Positions in active use (what a fallback should pick from) — the working
   // sectors owners are mapped to, plus the current fallback.
@@ -170,15 +207,12 @@ export function LiveCaptureEdit() {
   const setAll = (v: boolean) => setInclude(() => v);
   const includeOnlyOwners = () => setInclude(a => ownerSel.has(ownerKey(a)));
   const includeOnlyRoute = () => setInclude(a => (routeSectors[a.gufi] || []).some(s => routeSel.has(s)));
-  const removeRandom = () => {
-    if (randomPct <= 0) return;
-    setCap(c => {
-      if (!c) return c;
-      const inc = c.aircraft.filter(a => a.include);
-      const n = Math.floor((inc.length * Math.min(100, randomPct)) / 100);
-      const victims = new Set([...inc].sort(() => Math.random() - 0.5).slice(0, n).map(a => a.gufi));
-      return { ...c, aircraft: c.aircraft.map(a => (victims.has(a.gufi) ? { ...a, include: false } : a)) };
-    });
+  // Stable per-aircraft value in [0,1) so the keep-% is monotonic (raising the
+  // percentage only ADDS aircraft, never reshuffles the existing picks).
+  const hashUnit = (s: string) => {
+    let h = 2166136261;
+    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return ((h >>> 0) % 100000) / 100000;
   };
 
   // ── "touches our airspace" filter — drop traffic that never enters the
@@ -210,6 +244,16 @@ export function LiveCaptureEdit() {
   const removeNonTouching = () =>
     setCap(c => (c ? { ...c, aircraft: c.aircraft.map(a => ({ ...a, include: a.include && touchesOurAirspace(a) })) } : c));
 
+  // FINAL filter step: include pct% (0=none, 100=all) of the aircraft that pass
+  // the airspace filter AND the by-owner selection. Reflected live in the table.
+  const eligibleForKeep = (a: CaptureAircraft) =>
+    touchesOurAirspace(a) && (ownerSel.size === 0 || ownerSel.has(ownerKey(a)));
+  const applyKeep = (pct: number) => {
+    setKeepPct(pct);
+    setCap(c => (c ? { ...c, aircraft: c.aircraft.map(a => ({ ...a, include: eligibleForKeep(a) && hashUnit(a.gufi) < pct / 100 })) } : c));
+  };
+  const eligibleCount = aircraft.filter(eligibleForKeep).length;
+
   // Auto-apply once route data lands (the default: only keep aircraft that
   // actually enter our airspace). Runs a single time; manual edits afterward win.
   const autoFilteredRef = useRef(false);
@@ -233,8 +277,7 @@ export function LiveCaptureEdit() {
     if (!atcEnabled) return { label: '—', trainee: false };
     const pid = ownerToPosition[ownerKey(a)] || fallbackPos;
     if (!pid) return { label: '(unowned)', trainee: false };
-    const p = posById(pid);
-    return { label: p ? (p.callsign || p.name || pid) : pid, trainee: traineePositions.has(pid) };
+    return { label: posLabel(pid), trainee: traineePositions.has(pid) };
   };
   const ownedCount = included.filter(a => !!(ownerToPosition[ownerKey(a)] || fallbackPos)).length;
   const usedPosIds = Array.from(new Set([
@@ -280,14 +323,22 @@ export function LiveCaptureEdit() {
   };
 
   // ── scope ──
+  const scopePz = useSvgPanZoom(W, H);
+  // Fit the view to the sector polygons AND every included aircraft, so geofenced
+  // neighbors/inbounds (well outside the polygons) still show, and the map works
+  // even if sector geometry didn't load.
   const box = useMemo(() => {
     let mnLon = Infinity, mnLat = Infinity, mxLon = -Infinity, mxLat = -Infinity;
-    for (const s of geom) for (const ring of s.rings) for (const [lon, lat] of ring) {
+    const ext = (lon: number, lat: number) => {
       mnLon = Math.min(mnLon, lon); mxLon = Math.max(mxLon, lon);
       mnLat = Math.min(mnLat, lat); mxLat = Math.max(mxLat, lat);
+    };
+    for (const s of geom) for (const ring of s.rings) for (const [lon, lat] of ring) ext(lon, lat);
+    for (const a of aircraft) {
+      if (a.include && a.spawn.lat != null && a.spawn.lon != null) ext(a.spawn.lon, a.spawn.lat);
     }
     return Number.isFinite(mnLon) ? { mnLon, mnLat, mxLon, mxLat } : null;
-  }, [geom]);
+  }, [geom, aircraft]);
   const project = (lon: number, lat: number): [number, number] => {
     if (!box) return [0, 0];
     const midLat = (box.mnLat + box.mxLat) / 2;
@@ -345,31 +396,46 @@ export function LiveCaptureEdit() {
             <label className="row" style={{ gap: 8, alignItems: 'center', fontSize: 12 }}>
               Fallback (unmatched owners):
               <select className="themed" style={{ minWidth: 240 }}
-                value={fallbackPos} onChange={e => setFallbackPos(e.target.value)}>
+                value={fallbackPos}
+                onChange={e => { fallbackTouchedRef.current = true; setFallbackPos(e.target.value); }}>
                 <option value="">(none — leave unowned)</option>
-                {mappedPositions.map(id => (
-                  <option key={id} value={id}>{posLabel(id)}</option>
+                {byFacility(Object.entries(mappedPositions.reduce((acc, id) => {
+                  const p = posById(id);
+                  const f = p?.facilityId || p?.facility || '?';
+                  (acc[f] = acc[f] || []).push(id);
+                  return acc;
+                }, {} as Record<string, string[]>))).map(([f, ids]) => (
+                  <optgroup key={f} label={f}>
+                    {ids.map(id => <option key={id} value={id}>{posLabel(id)}</option>)}
+                  </optgroup>
                 ))}
               </select>
               <span style={{ color: 'var(--fg-secondary)' }}>or</span>
               <input list="ssg-positions" className="themed" style={{ minWidth: 200 }}
                 value="" placeholder="search any position…"
-                onChange={e => { const id = labelToId.get(e.target.value); if (id) setFallbackPos(id); }} />
+                onChange={e => { const id = labelToId.get(e.target.value); if (id) { fallbackTouchedRef.current = true; setFallbackPos(id); } }} />
             </label>
-            <div style={{ maxHeight: 160, overflow: 'auto', fontSize: 12 }}>
-              {activeOwners.map(k => (
-                <div key={k} className="row" style={{ gap: 8, alignItems: 'center', marginBottom: 3 }}>
-                  <span style={{ width: 96, fontFamily: 'monospace' }}>
-                    {k} <span style={{ color: 'var(--fg-secondary)' }}>({countByOwner.get(k) || 0})</span>
-                  </span>
-                  <span style={{ color: 'var(--fg-secondary)' }}>→</span>
-                  <input list="ssg-positions" className="themed" style={{ minWidth: 240 }}
-                    value={idToLabel.get(ownerToPosition[k]) ?? ''} placeholder="(use fallback)"
-                    onFocus={e => e.currentTarget.select()}
-                    onChange={e => {
-                      const id = labelToId.get(e.target.value) || '';
-                      setOwnerToPosition(m => ({ ...m, [k]: id }));
-                    }} />
+            <div style={{ maxHeight: '55vh', overflowY: 'auto', overflowX: 'hidden', fontSize: 12, border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 6 }}>
+              {ownersByFacility.map(([fac, keys]) => (
+                <div key={fac} style={{ marginBottom: 4 }}>
+                  <div style={{ fontWeight: 600, fontSize: 11, color: 'var(--accent, #8ab4f8)', margin: '5px 0 2px', position: 'sticky', top: 0, background: 'var(--bg-primary, #1a1a1a)' }}>
+                    {fac} <span style={{ fontWeight: 400, color: 'var(--fg-secondary)' }}>({keys.length} sector{keys.length === 1 ? '' : 's'})</span>
+                  </div>
+                  {keys.map(k => (
+                    <div key={k} className="row" style={{ gap: 8, alignItems: 'center', marginBottom: 3, paddingLeft: 8 }}>
+                      <span style={{ width: 64, fontFamily: 'monospace' }}>
+                        {k.split('/')[1]} <span style={{ color: 'var(--fg-secondary)' }}>({countByOwner.get(k) || 0})</span>
+                      </span>
+                      <span style={{ color: 'var(--fg-secondary)' }}>→</span>
+                      <input list="ssg-positions" className="themed" style={{ minWidth: 240 }}
+                        value={idToLabel.get(ownerToPosition[k]) ?? ''} placeholder="(use fallback)"
+                        onFocus={e => e.currentTarget.select()}
+                        onChange={e => {
+                          const id = labelToId.get(e.target.value) || '';
+                          setOwnerToPosition(m => ({ ...m, [k]: id }));
+                        }} />
+                    </div>
+                  ))}
                 </div>
               ))}
             </div>
@@ -384,15 +450,25 @@ export function LiveCaptureEdit() {
       {/* 2. trainee positions */}
       {atcEnabled && usedPosIds.length > 0 && (
         <Section title="2. Trainee position(s) — you work these">
-          <div className="row" style={{ gap: 5, flexWrap: 'wrap' }}>
-            {usedPosIds.map(id => {
+          <div style={{ maxHeight: 140, overflow: 'auto' }}>
+            {byFacility(Object.entries(usedPosIds.reduce((acc, id) => {
               const p = posById(id);
-              const label = p ? (p.callsign || p.name || id) : id;
-              return (
-                <span key={id} style={chip(traineePositions.has(id))}
-                  onClick={() => toggle(traineePositions, setTraineePositions, id)}>{label}</span>
-              );
-            })}
+              const f = p?.facilityId || p?.facility || '?';
+              (acc[f] = acc[f] || []).push(id);
+              return acc;
+            }, {} as Record<string, string[]>))).map(([f, ids]) => (
+              <div key={f} className="row" style={{ gap: 5, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
+                <span style={{ width: 44, fontSize: 11, fontWeight: 600, color: 'var(--accent, #8ab4f8)' }}>{f}</span>
+                {ids.map(id => {
+                  const p = posById(id);
+                  const label = p ? `${p.sectorId ? `${p.sectorId} ` : ''}${p.name || p.callsign || id}` : id;
+                  return (
+                    <span key={id} style={chip(traineePositions.has(id))}
+                      onClick={() => toggle(traineePositions, setTraineePositions, id)}>{label}</span>
+                  );
+                })}
+              </div>
+            ))}
           </div>
           <label className="row" style={{ gap: 8, alignItems: 'center', fontSize: 12, marginTop: 6 }}>
             <input type="checkbox" checked={handoffFromTimeline} onChange={e => setHandoffFromTimeline(e.target.checked)} />
@@ -410,22 +486,24 @@ export function LiveCaptureEdit() {
           <ThemedButton secondary onClick={() => setAll(true)}>Include all</ThemedButton>
           <ThemedButton secondary onClick={() => setAll(false)}>Include none</ThemedButton>
           <ThemedButton secondary onClick={removeNonTouching}>Remove not entering {ourFac}</ThemedButton>
-          <span style={{ marginLeft: 8 }}>
-            <ThemedInput type="number" min={0} max={100} style={{ width: 56 }} value={randomPct}
-              onChange={e => setRandomPct(Number(e.target.value) || 0)} /> %
-            <ThemedButton secondary onClick={removeRandom} style={{ marginLeft: 6 }}>Remove random</ThemedButton>
-          </span>
         </div>
         {activeOwners.length > 0 && (
           <div style={{ marginTop: 8 }}>
-            <div style={{ fontSize: 12, color: 'var(--fg-secondary)', marginBottom: 4 }}>By owner (FAC/SEC):</div>
-            <div className="row" style={{ gap: 5, flexWrap: 'wrap' }}>
-              {activeOwners.map(k => (
-                <span key={k} style={chip(ownerSel.has(k))} onClick={() => toggle(ownerSel, setOwnerSel, k)}>
-                  {k} ({countByOwner.get(k) || 0})
-                </span>
+            <div className="row" style={{ justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
+              <span style={{ fontSize: 12, color: 'var(--fg-secondary)' }}>By owner (grouped by facility):</span>
+              <ThemedButton secondary onClick={includeOnlyOwners} disabled={ownerSel.size === 0}>Include only selected</ThemedButton>
+            </div>
+            <div style={{ maxHeight: 160, overflow: 'auto' }}>
+              {ownersByFacility.map(([fac, keys]) => (
+                <div key={fac} className="row" style={{ gap: 5, flexWrap: 'wrap', alignItems: 'center', marginBottom: 4 }}>
+                  <span style={{ width: 44, fontSize: 11, fontWeight: 600, color: 'var(--accent, #8ab4f8)' }}>{fac}</span>
+                  {keys.map(k => (
+                    <span key={k} style={chip(ownerSel.has(k))} onClick={() => toggle(ownerSel, setOwnerSel, k)}>
+                      {k.split('/')[1]} ({countByOwner.get(k) || 0})
+                    </span>
+                  ))}
+                </div>
               ))}
-              <ThemedButton secondary onClick={includeOnlyOwners} disabled={ownerSel.size === 0}>Include only these</ThemedButton>
             </div>
           </div>
         )}
@@ -440,11 +518,31 @@ export function LiveCaptureEdit() {
             </div>
           </div>
         )}
+        {/* FINAL step: keep a percentage of the (airspace + owner) filtered set. */}
+        <div style={{ marginTop: 12, paddingTop: 10, borderTop: '1px solid var(--border)' }}>
+          <div className="row" style={{ gap: 10, alignItems: 'center' }}>
+            <span style={{ fontSize: 12, fontWeight: 600 }}>Final amount:</span>
+            <input type="range" min={0} max={100} step={5} value={keepPct} style={{ flex: 1, maxWidth: 320 }}
+              onChange={e => applyKeep(Number(e.target.value))} />
+            <span style={{ fontVariantNumeric: 'tabular-nums', width: 40, textAlign: 'right' }}>{keepPct}%</span>
+            <span style={{ fontSize: 12, color: 'var(--fg-secondary)' }}>
+              → {included.length} of {eligibleCount}{ownerSel.size > 0 ? ' (selected owners)' : ''}
+            </span>
+          </div>
+          <p style={{ fontSize: 11, color: 'var(--fg-secondary)', margin: '4px 0 0' }}>
+            Keeps this % of aircraft that enter {ourFac}{ownerSel.size > 0 ? ' and belong to the selected owners' : ''}.
+            0 = none, 100 = all. Applied as the last filter — the table below updates to match.
+          </p>
+        </div>
       </Section>
 
       {/* scope */}
-      <svg width="100%" viewBox={`0 0 ${W} ${H}`}
-        style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', margin: '10px 0' }}>
+      <div style={{ position: 'relative', margin: '10px 0' }}>
+        <span style={{ position: 'absolute', top: 4, right: 8, fontSize: 10, color: 'var(--fg-secondary)', pointerEvents: 'none' }}>
+          scroll to zoom · drag to pan · double-click to reset
+        </span>
+      <svg ref={scopePz.ref} width="100%" viewBox={scopePz.viewBox} {...scopePz.panHandlers}
+        style={{ background: '#0b0f14', border: '1px solid var(--border)', borderRadius: 'var(--radius)', cursor: 'grab', touchAction: 'none' }}>
         {geom.map((s, si) => s.rings.map((ring, ri) => (
           <polyline key={`${si}-${ri}`} points={ring.map(([lon, lat]) => project(lon, lat).join(',')).join(' ')}
             fill="none" stroke="#2e7d32" strokeWidth={1} opacity={0.7} />
@@ -461,6 +559,7 @@ export function LiveCaptureEdit() {
           );
         })}
       </svg>
+      </div>
 
       {/* table */}
       <div style={{ maxHeight: 240, overflow: 'auto' }}>

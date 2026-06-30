@@ -1,6 +1,7 @@
 import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import { createWriteStream } from 'node:fs';
 import { generateScenario } from './ipc/scenario';
 import { listAirports } from './ipc/airports';
 import { uploadScenario, resetVnasSession, clearVnasCookies, dumpScenario } from './ipc/vnas';
@@ -18,26 +19,12 @@ const RELEASES_API =
 const RELEASES_HTML =
   'https://github.com/yanjz124/Sweatbox-Scenario-Generator--SSG-/releases/latest';
 
-function compareSemver(a: string, b: string): number {
-  const parts = (s: string) =>
-    s.trim().replace(/^v/i, '').split(/[.-]/).map(p => parseInt(p, 10) || 0);
-  const aa = parts(a);
-  const bb = parts(b);
-  const n = Math.max(aa.length, bb.length);
-  for (let i = 0; i < n; i++) {
-    const av = aa[i] ?? 0;
-    const bv = bb[i] ?? 0;
-    if (av > bv) return 1;
-    if (av < bv) return -1;
-  }
-  return 0;
-}
-
 async function checkForUpdates(): Promise<{
   currentVersion: string;
   latestVersion: string | null;
   updateAvailable: boolean;
   releaseUrl: string;
+  downloadUrl: string | null;
   error?: string;
 }> {
   const currentVersion = app.getVersion();
@@ -51,23 +38,64 @@ async function checkForUpdates(): Promise<{
         latestVersion: null,
         updateAvailable: false,
         releaseUrl: RELEASES_HTML,
+        downloadUrl: null,
         error: `GitHub responded ${res.status}`,
       };
     }
-    const data = (await res.json()) as { tag_name?: string; html_url?: string };
-    const latestVersion = (data.tag_name || '').replace(/^v/i, '') || null;
+    const data = (await res.json()) as {
+      tag_name?: string; name?: string; html_url?: string;
+      assets?: Array<{ name?: string; browser_download_url?: string }>;
+    };
+    const tag = (data.tag_name || '').trim();
+    const latestVersion = (data.name || tag || '').replace(/^v/i, '') || null;
     const releaseUrl = data.html_url || RELEASES_HTML;
-    const updateAvailable =
-      !!latestVersion && compareSemver(latestVersion, currentVersion) > 0;
-    return { currentVersion, latestVersion, updateAvailable, releaseUrl };
+    // Releases are tagged by commit hash and our version embeds that hash, so
+    // "the latest release's tag isn't in my version" == an update is available.
+    const updateAvailable = !!tag && !currentVersion.includes(tag);
+    const exe = (data.assets || []).find(a => (a.name || '').toLowerCase().endsWith('.exe'));
+    const downloadUrl = exe?.browser_download_url || null;
+    return { currentVersion, latestVersion, updateAvailable, releaseUrl, downloadUrl };
   } catch (err) {
     return {
       currentVersion,
       latestVersion: null,
       updateAvailable: false,
       releaseUrl: RELEASES_HTML,
+      downloadUrl: null,
       error: String(err),
     };
+  }
+}
+
+/** Download the release installer with progress, launch it, and quit so it can
+ *  replace the running app. */
+async function downloadAndInstallUpdate(
+  url: string,
+  onProgress: (fraction: number) => void,
+): Promise<{ ok: boolean; error?: string }> {
+  try {
+    const dest = path.join(app.getPath('temp'), `SSG-Setup-${Date.now()}.exe`);
+    const res = await fetch(url);
+    if (!res.ok || !res.body) return { ok: false, error: `download failed (${res.status})` };
+    const total = Number(res.headers.get('content-length')) || 0;
+    const out = createWriteStream(dest);
+    let received = 0;
+    const reader = (res.body as ReadableStream<Uint8Array>).getReader();
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      received += value.length;
+      out.write(Buffer.from(value));
+      if (total) onProgress(received / total);
+    }
+    await new Promise<void>((resolve, reject) => { out.end(() => resolve()); out.on('error', reject); });
+    onProgress(1);
+    // Launch the NSIS installer, then quit so it can update over the running app.
+    await shell.openPath(dest);
+    setTimeout(() => app.quit(), 1200);
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, error: String(e) };
   }
 }
 
@@ -253,6 +281,11 @@ function registerIpc() {
   ipcMain.handle('vnas:reset', () => resetVnasSession());
   ipcMain.handle('vnas:clearCookies', () => clearVnasCookies());
   ipcMain.handle('app:checkForUpdates', () => checkForUpdates());
+  ipcMain.handle('app:downloadAndInstall', (e, url: string) =>
+    downloadAndInstallUpdate(url, p => {
+      if (!e.sender.isDestroyed()) e.sender.send('app:updateProgress', p);
+    }),
+  );
   ipcMain.handle('app:openExternal', (_e, url: string) => shell.openExternal(url));
 }
 

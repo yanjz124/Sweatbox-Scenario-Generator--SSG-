@@ -46,7 +46,10 @@ async function runBridgeAction(
   onSpawn?: (proc: ChildProcess) => void,
 ): Promise<BridgeActionResult> {
   const { cmd, args, cwd } = resolveBridgeCommand();
-  const tmpFile = path.join(os.tmpdir(), `ssg-action-${Date.now()}.json`);
+  // Unique per call — Date.now() alone collides when StrictMode (dev) fires the
+  // same effect twice in one tick, so two calls wrote into one config file →
+  // the bridge then read concatenated JSON ("Extra data: line N…").
+  const tmpFile = path.join(os.tmpdir(), `ssg-action-${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`);
   await fs.writeFile(tmpFile, JSON.stringify(payload, null, 2), 'utf8');
 
   const PROGRESS_RE = /Capture progress:\s*(\d+)\/(\d+)s\s*recorded=(\d+)\s*sectors=(\d+)/i;

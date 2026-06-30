@@ -81,6 +81,7 @@ class CapturedAircraft:
     origin: Optional[str] = None
     destination: Optional[str] = None
     route: Optional[str] = None
+    original_route: Optional[str] = None
     star: Optional[str] = None
     cruise_altitude_ft: Optional[int] = None
     assigned_altitude_ft: Optional[int] = None
@@ -129,9 +130,11 @@ class CapturedAircraft:
             ground_speed_kt=_int(gs),
             origin=flight.get("origin"),
             destination=flight.get("destination"),
-            # Prefer the current (possibly ATC-amended) route; fall back to the
-            # originally-filed route if the amended one is blank.
-            route=flight.get("route") or flight.get("originalRoute"),
+            # Keep BOTH: the active route can be expanded to bare fixes, while the
+            # filed originalRoute usually retains procedure names (SID/STAR/airways).
+            # The replay picks whichever is more "procedural".
+            route=flight.get("route"),
+            original_route=flight.get("originalRoute"),
             star=flight.get("star"),
             cruise_altitude_ft=_int(cruise_alt),
             assigned_altitude_ft=_int(assigned),
@@ -403,6 +406,7 @@ class CaptureResult:
                         "departure": a.origin,
                         "destination": a.destination,
                         "route": a.route,
+                        "originalRoute": a.original_route,
                         "star": a.star,
                         "cruiseAltitudeFt": a.cruise_altitude_ft,
                         "assignedAltitudeFt": a.assigned_altitude_ft,

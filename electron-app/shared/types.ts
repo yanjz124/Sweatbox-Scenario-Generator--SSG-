@@ -464,8 +464,11 @@ declare global {
           latestVersion: string | null;
           updateAvailable: boolean;
           releaseUrl: string;
+          downloadUrl: string | null;
           error?: string;
         }>;
+        downloadAndInstall(url: string): Promise<{ ok: boolean; error?: string }>;
+        onUpdateProgress(cb: (fraction: number) => void): () => void;
         openExternal(url: string): Promise<void>;
       };
     };

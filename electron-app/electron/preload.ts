@@ -86,8 +86,16 @@ contextBridge.exposeInMainWorld('ssg', {
       latestVersion: string | null;
       updateAvailable: boolean;
       releaseUrl: string;
+      downloadUrl: string | null;
       error?: string;
     }> => ipcRenderer.invoke('app:checkForUpdates'),
+    downloadAndInstall: (url: string): Promise<{ ok: boolean; error?: string }> =>
+      ipcRenderer.invoke('app:downloadAndInstall', url),
+    onUpdateProgress: (cb: (fraction: number) => void): (() => void) => {
+      const h = (_e: unknown, p: number) => cb(p);
+      ipcRenderer.on('app:updateProgress', h);
+      return () => ipcRenderer.removeListener('app:updateProgress', h);
+    },
     openExternal: (url: string): Promise<void> =>
       ipcRenderer.invoke('app:openExternal', url),
   },

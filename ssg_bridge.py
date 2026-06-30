@@ -837,7 +837,11 @@ def _fetch_artcc_raw(artcc_id, logger, cache_ttl=86400):
             r = requests.get(url, timeout=30)
             r.raise_for_status()
             data = r.json()
-            cf.write_text(json.dumps(data), encoding='utf-8')
+            # Atomic write (temp + replace) so a concurrent bridge process can
+            # never read a half-written / concatenated cache ("Extra data").
+            tmp = cf.with_suffix(f'.{os.getpid()}.tmp')
+            tmp.write_text(json.dumps(data), encoding='utf-8')
+            os.replace(tmp, cf)
             return data
         except Exception as e:  # noqa: BLE001
             last_err = e
