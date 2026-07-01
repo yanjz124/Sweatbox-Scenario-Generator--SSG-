@@ -121,12 +121,17 @@ class LiveReplayScenario:
         self.atc_roster: List[Dict] = []
 
     def _build_atc_roster(self, position_ids) -> List[Dict]:
-        """One auto-connecting ghost per position that owns a track, INCLUDING the
-        student's own sector — its ghost owns the trainee's tracks at load and
-        gives handoffs a target to flash to; the human takes that seat over when
-        they sign in. Nothing loads unowned."""
+        """One auto-connecting ghost per position that is active in the capture —
+        every sector that OWNS a track (position_ids) AND every sector that appears
+        as a handoff partner (the editor's atcEntries, i.e. from/to of captured
+        handoffs), plus the student's own seat. Staffing the handoff partners is
+        what lets the trainee hand traffic OUT to the next sector (e.g. an ORD
+        flight to a ZID sector): that receiving sector is online instead of
+        "SECTOR NOT ACTIVE". The human takes the student seat over on sign-in."""
         roster: List[Dict] = []
-        ids = list(position_ids)
+        # atcEntries = active owners + handoff partners; position_ids = the owners
+        # we actually assigned. Union them so downstream/upstream sectors are live.
+        ids = list(self._atc_meta.keys()) + list(position_ids)
         if self.student_position_id:
             ids.append(self.student_position_id)  # always staff the trainee seat
         for pid in dict.fromkeys(p for p in ids if p):  # dedupe, ordered
@@ -353,29 +358,38 @@ class LiveReplayScenario:
                     aircraft.auto_track_position_id = owner
 
             # Re-issue captured controller instructions so the AI flies the real
-            # climb/descent/speed profile — but NOT on aircraft bound for the
-            # student (those are the trainee's to work), and only when AIRBORNE (a
-            # CM on the ground errors). Timed changes replay as WAIT at their
-            # offset; ground speed alone isn't enough (taxi/takeoff roll have
-            # speed but are on the ground) so also require some altitude.
+            # profile. Only when AIRBORNE (a CM on the ground errors; ground speed
+            # alone isn't enough — taxi/takeoff roll have speed but are on the
+            # ground — so also require some altitude).
+            #
+            # For aircraft bound for the STUDENT we still issue the initial
+            # ALTITUDE clearance (climb/descend to the captured cleared level): the
+            # upstream ghost owns it until the handoff and flies it there, so the
+            # trainee is handed an aircraft in its real state (e.g. climbing to its
+            # filed FL320) instead of one frozen at the spawn altitude. Speed,
+            # heading, scratchpad and later timed changes are left for the trainee.
             airborne = ground_speed >= 40 and spawn_alt >= 1500
             on_arrival = bool((fp.get("star") or "").strip())
-            if not goes_to_student:
+            if airborne:
                 timed: List[tuple] = []  # (offsetSec, command)
-                if airborne:
-                    init_cmds, scratch = self._clearance_commands(
-                        entry.get("clearances") or {}, cruise_alt, on_arrival=on_arrival,
-                    )
+                init_cmds, scratch = self._clearance_commands(
+                    entry.get("clearances") or {}, cruise_alt, on_arrival=on_arrival,
+                )
+                if goes_to_student:
+                    for c in init_cmds:
+                        if c.startswith(("CM", "DVIA")):
+                            timed.append((0, c))
+                else:
                     for c in init_cmds:
                         timed.append((0, c))
                     if scratch:
                         aircraft.auto_track_scratchpad = scratch
-                for ev in (entry.get("clearanceEvents") or []):
-                    if ev.get("atOffsetSec") is None:
-                        continue
-                    c = self._event_command(ev)
-                    if c:
-                        timed.append((max(0, int(ev["atOffsetSec"]) - first), c))
+                    for ev in (entry.get("clearanceEvents") or []):
+                        if ev.get("atOffsetSec") is None:
+                            continue
+                        c = self._event_command(ev)
+                        if c:
+                            timed.append((max(0, int(ev["atOffsetSec"]) - first), c))
                 timed.sort(key=lambda x: x[0])
                 if timed:
                     aircraft.preset_commands = [
