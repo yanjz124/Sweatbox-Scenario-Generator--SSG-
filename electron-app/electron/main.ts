@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, dialog, shell } from 'electron';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
 import { createWriteStream } from 'node:fs';
+import { spawn } from 'node:child_process';
 import { generateScenario } from './ipc/scenario';
 import { listAirports } from './ipc/airports';
 import { uploadScenario, resetVnasSession, clearVnasCookies, dumpScenario } from './ipc/vnas';
@@ -97,9 +98,16 @@ async function downloadAndInstallUpdate(
     }
     await new Promise<void>((resolve, reject) => { out.end(() => resolve()); out.on('error', reject); });
     onProgress(1);
-    // Launch the NSIS installer, then quit so it can update over the running app.
-    await shell.openPath(dest);
-    setTimeout(() => app.quit(), 1200);
+    // Launch the NSIS installer DETACHED so it outlives SSG. shell.openPath (and a
+    // normal spawn) make the installer a CHILD of SSG — then quitting SSG kills the
+    // installer, and the installer can't overwrite a still-running SSG. detached +
+    // its own process group + unref cuts that tie: SSG quits, the installer keeps
+    // running, waits for the app to close, and updates. `start` re-parents it to
+    // the shell as a final safety net.
+    const child = spawn(dest, [], { detached: true, stdio: 'ignore', windowsHide: false });
+    child.on('error', () => { void shell.openPath(dest); });
+    child.unref();
+    setTimeout(() => app.quit(), 800);
     return { ok: true };
   } catch (e) {
     return { ok: false, error: String(e) };
