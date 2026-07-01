@@ -345,15 +345,28 @@ class LiveReplayScenario:
             elif goes_to_student:
                 off, upstream_key = student_handoff
                 owner = self._owner_position(upstream_key)
+                if not owner:
+                    # Direct upstream sector isn't mapped — use the first sector we
+                    # DO staff that owns it before the trainee took it, so someone
+                    # can flash the handoff; failing that, give it to the student.
+                    owner = self._first_known_handoff_owner(handoffs, before=off)
                 if owner:
                     aircraft.auto_track_position_id = owner
                     # Flash to the student at the real handoff time (≥1s so it
                     # actually flashes instead of spawning already owned).
                     aircraft.auto_track_handoff_delay = max(1, off - first)
+                elif self.student_position_id:
+                    aircraft.auto_track_position_id = self.student_position_id
             else:
                 # Background traffic the trainee never works — owned by its (ghost)
                 # sector the whole time for a realistic scope picture.
                 owner = self._owner_position(spawn_key)
+                if not owner:
+                    # Untracked at spawn (unmapped sector, no fallback): pick it up
+                    # at the first later handoff into a sector we staff, so it isn't
+                    # left untracked. Owned from spawn by that position (vNAS has no
+                    # "begin tracking at T" for a ghost, only handoffDelay-to-student).
+                    owner = self._first_known_handoff_owner(handoffs)
                 if owner:
                     aircraft.auto_track_position_id = owner
 
@@ -408,6 +421,20 @@ class LiveReplayScenario:
         if pid and (self._atc_meta.get(pid) or {}).get("isStars"):
             return self.fallback_position  # avoid STARS InitiateControl / ILL TRK
         return pid or self.fallback_position
+
+    def _first_known_handoff_owner(self, handoffs, before: Optional[int] = None) -> Optional[str]:
+        """The first captured handoff whose TARGET sector resolves to a position we
+        staff (optionally only handoffs before ``before`` seconds). Lets an aircraft
+        that spawned untracked (unmapped sector, no fallback) get picked up once it
+        crosses into a sector we do know, instead of floating untracked all run."""
+        for h in handoffs:
+            if before is not None and int(h["atOffsetSec"]) >= before:
+                break
+            cand = self._owner_position(
+                f"{(h.get('toFacility') or '').upper()}/{(h.get('toSector') or '').upper()}")
+            if cand:
+                return cand
+        return None
 
     def _event_command(self, ev: Dict) -> Optional[str]:
         """A timed clearance event -> a vNAS command (no WAIT prefix)."""
