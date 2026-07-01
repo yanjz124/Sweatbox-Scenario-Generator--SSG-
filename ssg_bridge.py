@@ -330,6 +330,12 @@ def dispatch(cfg):
         capture_file = cfg.get('captureFile')
         if not capture_file:
             raise ValueError("live_replay scenario requires a 'captureFile' path")
+        if not Path(capture_file).is_file():
+            raise ValueError(
+                f"Capture file not found: {Path(capture_file).name}. The capture may "
+                "not have finished saving (e.g. it was interrupted, or SSG was closed "
+                "mid-capture). Re-run the capture, then generate again."
+            )
         sc = LiveReplayScenario.from_file(
             capture_file,
             hold_initial_altitude=bool(cfg.get('holdInitialAltitude', False)),

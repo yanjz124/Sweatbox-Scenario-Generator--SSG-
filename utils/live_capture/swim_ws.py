@@ -24,6 +24,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 import re
 import threading
 import time
@@ -478,7 +479,19 @@ class CaptureResult:
     def write(self, path: str | Path) -> Path:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(self.to_dict(), indent=2), encoding="utf-8")
+        # Write atomically: serialize to a temp file in the same dir, then replace.
+        # A crash/kill mid-write then leaves the PREVIOUS good file (or nothing),
+        # never a half-written capture that fails to parse at generate time.
+        data = json.dumps(self.to_dict(), indent=2)
+        tmp = path.with_name(f"{path.name}.{os.getpid()}.tmp")
+        try:
+            tmp.write_text(data, encoding="utf-8")
+            os.replace(tmp, path)
+        finally:
+            try:
+                tmp.unlink()
+            except OSError:
+                pass
         logger.info(f"Wrote capture file: {path} ({len(self.aircraft)} aircraft)")
         return path
 
