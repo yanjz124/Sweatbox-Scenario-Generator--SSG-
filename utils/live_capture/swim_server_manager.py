@@ -180,14 +180,25 @@ class SwimServerManager:
         if detached:
             # Detach so the child outlives this bridge process (warm server).
             flags |= getattr(subprocess, "DETACHED_PROCESS", 0)
-        # SwimServer is a console/web app; discard its stdio so it doesn't spam
-        # the console.
+        # Capture SwimServer's console output to a log instead of discarding it —
+        # a "Server up but no data" hang is otherwise a black box. The log shows the
+        # real Solace/SFDPS cause: bad user/pass, wrong/nonexistent queue, an
+        # EXCLUSIVE queue already bound by another client, or a TLS/firewall block on
+        # tcps://…:55443. The detached child inherits the handle and keeps writing
+        # after this short-lived bridge exits.
+        log_path = self._data_dir() / "swimserver.log"
+        try:
+            log_out = open(log_path, "w", encoding="utf-8", errors="replace")
+            logger.info(f"SwimServer log: {log_path}")
+        except OSError:
+            log_out = subprocess.DEVNULL
+        self._log_out = log_out  # keep a ref so it isn't closed before the child inherits it
         self._proc = subprocess.Popen(
             cmd,
             cwd=str(work_dir),
             env=env,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stdout=log_out,
+            stderr=subprocess.STDOUT,
             creationflags=flags,
         )
         if detached:
