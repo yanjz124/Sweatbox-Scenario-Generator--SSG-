@@ -785,6 +785,40 @@ def _action_capture(cfg, logger):
     }
 
 
+def _action_low_arrivals(cfg, logger):
+    """Return the gufis of aircraft that are BOTH low (below altFt) AND near their
+    destination (within distNm) — i.e. arrivals already on descent/final, the clutter
+    worth dropping. Low GA cruising FAR from its destination is kept (distance gate)."""
+    import math
+    from scenarios.live_replay import _airport_refpoint, _icao_airport
+    capture_file = cfg.get('captureFile')
+    if not capture_file or not Path(capture_file).is_file():
+        return {'status': 'error', 'message': 'capture file not found'}
+    alt_ft = int(cfg.get('altFt') or 10000)
+    dist_nm = float(cfg.get('distNm') or 30)
+    try:
+        cap = json.loads(Path(capture_file).read_text('utf-8'))
+    except Exception as e:  # noqa: BLE001
+        return {'status': 'error', 'message': str(e)}
+    gufis = []
+    for a in cap.get('aircraft', []):
+        sp = a.get('spawn') or {}
+        lat, lon, alt = sp.get('lat'), sp.get('lon'), sp.get('altitudeFt')
+        dest = _icao_airport((a.get('flightplan') or {}).get('destination'))
+        if lat is None or lon is None or alt is None or not dest:
+            continue
+        if alt >= alt_ft:
+            continue
+        rp = _airport_refpoint(dest)
+        if not rp:
+            continue
+        d = math.hypot((lat - rp[0]) * 60,
+                       (lon - rp[1]) * 60 * math.cos(math.radians((lat + rp[0]) / 2)))
+        if d <= dist_nm:
+            gufis.append(a.get('gufi'))
+    return {'status': 'ok', 'gufis': gufis, 'altFt': alt_ft, 'distNm': dist_nm}
+
+
 def _action_preview_replay(cfg, logger):
     """Run the live-replay generator on a capture and return a per-aircraft summary
     (flight plan, spawn, ownership, the auto-issued 'prefile' commands, timing) so
@@ -1106,6 +1140,9 @@ def main(config_path):
         return
     if action == 'preview_replay':
         print(json.dumps(_action_preview_replay(cfg, logger)))
+        return
+    if action == 'low_arrivals':
+        print(json.dumps(_action_low_arrivals(cfg, logger)))
         return
 
     aircraft, artcc_id = dispatch(cfg)

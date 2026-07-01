@@ -461,6 +461,7 @@ declare global {
         writeCapture(data: CaptureFile): Promise<string>;
         saveCapture(filePath: string, data: CaptureFile): Promise<{ ok: boolean; path?: string; message?: string }>;
         previewReplay(captureFile: string): Promise<{ status: string; aircraft?: ReplayPreviewRow[]; studentPositionId?: string | null; message?: string }>;
+        lowArrivals(captureFile: string, altFt: number, distNm: number): Promise<{ status: string; gufis?: string[]; message?: string }>;
         deleteCapture(filePath: string): Promise<{ ok: boolean; message?: string }>;
         startCapture(req: CaptureRequest): Promise<CaptureResult>;
         stopCapture(): Promise<{ stopped: boolean }>;

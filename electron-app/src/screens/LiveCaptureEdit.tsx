@@ -35,6 +35,7 @@ export function LiveCaptureEdit() {
   // Per-callsign preview of what the generator would emit (prefile commands etc.).
   const [preview, setPreview] = useState<Record<string, ReplayPreviewRow>>({});
   const [previewing, setPreviewing] = useState(false);
+  const [filtering, setFiltering] = useState(false);
 
   const [ownerSel, setOwnerSel] = useState<Set<string>>(new Set());
   const [routeSel, setRouteSel] = useState<Set<string>>(new Set());
@@ -455,6 +456,24 @@ export function LiveCaptureEdit() {
     await window.ssg.fs.saveScenario(`${cap.facility || 'capture'}-aircraft.csv`, csv);
   };
 
+  // Exclude aircraft that are BOTH low AND near their destination — arrivals already
+  // on descent/final — while KEEPING low GA that's cruising far from its destination
+  // (the distance gate). Needs airport coords, so it runs on the bridge.
+  const removeLowNearDest = async () => {
+    if (!cap || !config.captureFile) return;
+    setFiltering(true);
+    try {
+      await persist();
+      const r = await window.ssg.liveCapture.lowArrivals(config.captureFile, 10000, 30);
+      if (r.status === 'ok' && r.gufis) {
+        const drop = new Set(r.gufis);
+        setCap(c => (c ? { ...c, aircraft: c.aircraft.map(a => (drop.has(a.gufi) ? { ...a, include: false } : a)) } : c));
+      }
+    } finally {
+      setFiltering(false);
+    }
+  };
+
   // Auto-save edits back to the capture file (debounced) so they're never lost —
   // reopening the capture, sharing it, or bouncing to the aircraft editor and back
   // all keep the current mappings/trainee/includes.
@@ -619,6 +638,10 @@ export function LiveCaptureEdit() {
           <ThemedButton secondary onClick={() => setAll(true)}>Include all</ThemedButton>
           <ThemedButton secondary onClick={() => setAll(false)}>Include none</ThemedButton>
           <ThemedButton secondary onClick={removeNonTouching}>Remove not entering {ourFac}</ThemedButton>
+          <ThemedButton secondary onClick={removeLowNearDest} disabled={filtering}
+            title="Exclude arrivals below 10,000 ft within 30 nm of their destination (keeps low GA cruising far out)">
+            {filtering ? 'Filtering…' : 'Remove low arrivals'}
+          </ThemedButton>
           <span style={{ flex: 1 }} />
           <ThemedButton secondary onClick={runPreview} disabled={previewing}>
             {previewing ? 'Previewing…' : 'Preview commands'}

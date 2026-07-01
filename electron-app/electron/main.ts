@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { generateScenario } from './ipc/scenario';
 import { listAirports } from './ipc/airports';
 import { uploadScenario, resetVnasSession, clearVnasCookies, dumpScenario } from './ipc/vnas';
-import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors, previewReplay, killCapture, killSwimServer } from './ipc/liveCapture';
+import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors, previewReplay, lowArrivals, killCapture, killSwimServer } from './ipc/liveCapture';
 import type {
   ScenarioConfig,
   SwimCredentialsInput,
@@ -227,6 +227,9 @@ function registerIpc() {
     getRouteSectors(facility, captureFile),
   );
   ipcMain.handle('liveCapture:previewReplay', (_e, captureFile: string) => previewReplay(captureFile));
+  ipcMain.handle('liveCapture:lowArrivals', (_e, captureFile: string, altFt: number, distNm: number) =>
+    lowArrivals(captureFile, altFt, distNm),
+  );
   ipcMain.handle('liveCapture:listCaptures', async () => {
     const dir = path.join(app.getPath('userData'), 'captures');
     try {

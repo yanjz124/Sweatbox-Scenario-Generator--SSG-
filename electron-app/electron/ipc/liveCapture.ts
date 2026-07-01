@@ -175,6 +175,14 @@ export async function previewReplay(
   return runBridgeAction({ action: 'preview_replay', captureFile });
 }
 
+export async function lowArrivals(
+  captureFile: string,
+  altFt: number,
+  distNm: number,
+): Promise<{ status: string; gufis?: string[]; message?: string }> {
+  return runBridgeAction({ action: 'low_arrivals', captureFile, altFt, distNm });
+}
+
 export async function connect(): Promise<{
   status: string;
   connected?: boolean;
