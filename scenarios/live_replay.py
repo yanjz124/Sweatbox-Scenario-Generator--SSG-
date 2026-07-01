@@ -339,7 +339,7 @@ class LiveReplayScenario:
                     aircraft.auto_track_position_id = self.student_position_id
             elif goes_to_student:
                 off, upstream_key = student_handoff
-                owner = self.owner_to_position.get(upstream_key) or self.fallback_position
+                owner = self._owner_position(upstream_key)
                 if owner:
                     aircraft.auto_track_position_id = owner
                     # Flash to the student at the real handoff time (≥1s so it
@@ -348,7 +348,7 @@ class LiveReplayScenario:
             else:
                 # Background traffic the trainee never works — owned by its (ghost)
                 # sector the whole time for a realistic scope picture.
-                owner = self.owner_to_position.get(spawn_key) or self.fallback_position
+                owner = self._owner_position(spawn_key)
                 if owner:
                     aircraft.auto_track_position_id = owner
 
@@ -383,6 +383,17 @@ class LiveReplayScenario:
                     ]
 
         return aircraft, None
+
+    def _owner_position(self, key: str) -> Optional[str]:
+        """Resolve an ownership key ("FAC/SEC") to the vNAS position that should
+        own the track. A STARS/TRACON position can only InitiateControl a track
+        genuinely in its airspace (enroute-positioned tracks fail "ILL TRK"), so
+        STARS owners are redirected to the enroute fallback (a center ghost).
+        Returns None when nothing can own it (track spawns untracked)."""
+        pid = self.owner_to_position.get(key)
+        if pid and (self._atc_meta.get(pid) or {}).get("isStars"):
+            return self.fallback_position  # avoid STARS InitiateControl / ILL TRK
+        return pid or self.fallback_position
 
     def _event_command(self, ev: Dict) -> Optional[str]:
         """A timed clearance event -> a vNAS command (no WAIT prefix)."""
