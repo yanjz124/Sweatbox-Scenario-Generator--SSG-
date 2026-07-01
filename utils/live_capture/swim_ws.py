@@ -208,8 +208,14 @@ class CaptureSession:
         self._last_owner: Dict[str, tuple] = {}
         # gufi -> last observed clearance dict, for change detection (timed replay)
         self._last_clr: Dict[str, dict] = {}
+        # gufi -> INITIAL entry snapshot for aircraft seen in-area before their
+        # flight plan arrived. We lock the entry position/time here and finalize
+        # once the plan comes in (so the spawn is the real entry point, outside the
+        # sector), dropping any that never get a plan by capture end.
+        self._provisional: Dict[str, dict] = {}
         self._max_handoffs = 30  # cap per aircraft to avoid bloat
         self._max_events = 60    # cap clearance events per aircraft
+        self._max_provisional = 4000  # backstop so planless traffic can't grow unbounded
 
         # Vicinity region: bbox of the selected sector polygons, expanded by
         # vicinity_nm. Nearby (non-owned) traffic inside it is captured and
@@ -315,9 +321,37 @@ class CaptureSession:
             # earlier); allow a later retry once data is complete.
             pass
         if not self._recordable(flight):
+            # No complete flight plan yet — but we DO have a position. Remember the
+            # FIRST entry point/time so that when the plan finally arrives we spawn
+            # where it really entered (outside the sector), not wherever it drifted
+            # to by then. Never finalized (so dropped at capture end) if the plan
+            # never comes.
+            lat = _num(flight.get("latitude"))
+            lon = _num(flight.get("longitude"))
+            if (lat is not None and lon is not None and gufi not in self._provisional
+                    and len(self._provisional) < self._max_provisional):
+                self._provisional[gufi] = {
+                    "lat": lat, "lon": lon,
+                    "alt": _num(flight.get("reportedAltitude")) or _num(flight.get("assignedAltitude")),
+                    "gs": _num(flight.get("groundSpeed")),
+                    "offset": max(0, int(offset_sec)),
+                    "basis": basis,
+                }
             return False
 
         ac = CapturedAircraft.from_summary(flight, max(0, offset_sec), basis)
+        # If we saw this aircraft enter before its plan arrived, lock the spawn to
+        # that earlier entry position/time (keeps late-arriving traffic spawning
+        # outside the sector instead of popping up mid-flight).
+        prov = self._provisional.pop(gufi, None)
+        if prov is not None:
+            ac.lat, ac.lon = prov["lat"], prov["lon"]
+            ac.first_seen_offset_sec = prov["offset"]
+            ac.membership_basis = basis = prov["basis"]
+            if prov["alt"] is not None:
+                ac.spawn_altitude_ft = int(round(prov["alt"]))
+            if prov["gs"] is not None:
+                ac.ground_speed_kt = int(round(prov["gs"]))
         ac.category = "vicinity" if basis == "vicinity" else "sector"
         self.recorded[gufi] = ac
         rsec = (flight.get("controllingSector") or "?").strip().upper() or "?"
@@ -327,6 +361,15 @@ class CaptureSession:
             (flight.get("controllingFacility") or "").strip().upper(),
             (flight.get("controllingSector") or "").strip().upper(),
         )
+        # Seed the clearance tracker at RECORD time so the first post-record change
+        # is measured against the spawn state (otherwise the first poll only seeds
+        # and that change — incl. a 4th-line update — is missed).
+        self._last_clr[gufi] = {
+            "alt": _num(flight.get("assignedAltitude")),
+            "interim": _num(flight.get("interimAltitude")),
+            "speed": (flight.get("clearanceSpeed") or None),
+            "heading": (flight.get("clearanceHeading") or None),
+        }
         logger.debug(
             f"Captured {self.recorded[gufi].callsign} into {self.facility}/{rsec} "
             f"at +{offset_sec}s ({basis})"
@@ -382,6 +425,12 @@ class CaptureSession:
                         "kind": kind,
                         "value": cur[kind],
                     })
+            # Keep the ERAM 4th-line scratchpad current: an aircraft captured 100nm
+            # out in a neighbor often has its 4th line updated before it reaches the
+            # trainee, so use the LATEST value (not the stale first-seen one).
+            fl = flight.get("fourthAdaptedField") or None
+            if fl:
+                ac.fourth_line = fl
         self._last_clr[gufi] = cur
 
     def ingest_message(self, msg: dict, offset_sec: int) -> int:
@@ -400,6 +449,7 @@ class CaptureSession:
                 gufis = [d.get("gufi") if isinstance(d, dict) else d for d in data]
             for g in gufis:
                 self._inside.discard(g)
+                self._provisional.pop(g, None)  # gone before its plan ever arrived
         return 0
 
 

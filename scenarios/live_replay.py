@@ -380,7 +380,8 @@ class LiveReplayScenario:
             # upstream ghost owns it until the handoff and flies it there, so the
             # trainee is handed an aircraft in its real state (e.g. climbing to its
             # filed FL320) instead of one frozen at the spawn altitude. Speed,
-            # heading, scratchpad and later timed changes are left for the trainee.
+            # heading and later timed changes are left for the trainee — but the
+            # 4th-line scratchpad IS set either way so the datablock reads current.
             airborne = ground_speed >= 40 and spawn_alt >= 1500
             on_arrival = bool((fp.get("star") or "").strip())
             if airborne:
@@ -388,6 +389,8 @@ class LiveReplayScenario:
                 init_cmds, scratch = self._clearance_commands(
                     entry.get("clearances") or {}, cruise_alt, on_arrival=on_arrival,
                 )
+                if scratch:
+                    aircraft.auto_track_scratchpad = scratch
                 if goes_to_student:
                     for c in init_cmds:
                         if c.startswith(("CM", "DVIA")):
@@ -395,8 +398,6 @@ class LiveReplayScenario:
                 else:
                     for c in init_cmds:
                         timed.append((0, c))
-                    if scratch:
-                        aircraft.auto_track_scratchpad = scratch
                     for ev in (entry.get("clearanceEvents") or []):
                         if ev.get("atOffsetSec") is None:
                             continue
