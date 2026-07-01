@@ -269,6 +269,24 @@ function registerIpc() {
     await fs.writeFile(out, JSON.stringify(data, null, 2), 'utf8');
     return out;
   });
+  ipcMain.handle('liveCapture:saveCapture', async (_e, filePath: string, data: unknown) => {
+    // Persist edits back to an EXISTING capture file in place (atomically), so the
+    // position mappings, trainee, includes and per-aircraft fixes survive reopening
+    // and travel with a shared capture. Restricted to the captures dir.
+    const dir = path.join(app.getPath('userData'), 'captures');
+    const resolved = path.resolve(filePath);
+    if (path.dirname(resolved) !== path.resolve(dir)) {
+      return { ok: false, message: 'refused: outside captures directory' };
+    }
+    try {
+      const tmp = `${resolved}.${Date.now()}.tmp`;
+      await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
+      await fs.rename(tmp, resolved); // atomic replace — never leaves a partial file
+      return { ok: true, path: resolved };
+    } catch (e) {
+      return { ok: false, message: String(e) };
+    }
+  });
   ipcMain.handle('liveCapture:deleteCapture', async (_e, filePath: string) => {
     // Only allow deleting files inside the app's captures dir.
     const dir = path.join(app.getPath('userData'), 'captures');

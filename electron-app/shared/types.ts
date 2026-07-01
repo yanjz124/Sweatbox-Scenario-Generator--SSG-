@@ -438,6 +438,7 @@ declare global {
         listCaptures(): Promise<CaptureFileInfo[]>;
         readCapture(filePath: string): Promise<CaptureFile | null>;
         writeCapture(data: CaptureFile): Promise<string>;
+        saveCapture(filePath: string, data: CaptureFile): Promise<{ ok: boolean; path?: string; message?: string }>;
         deleteCapture(filePath: string): Promise<{ ok: boolean; message?: string }>;
         startCapture(req: CaptureRequest): Promise<CaptureResult>;
         stopCapture(): Promise<{ stopped: boolean }>;

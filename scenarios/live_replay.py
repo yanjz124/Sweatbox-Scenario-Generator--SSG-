@@ -190,6 +190,11 @@ class LiveReplayScenario:
         # AID"). Keep the first occurrence (entries are ordered by first-seen).
         seen_callsigns: set = set()
         for entry in entries:
+            # Respect the editor's include flag so a saved capture can carry ALL
+            # aircraft (with their edits) and still generate only the chosen ones.
+            # Absent flag = included (raw captures have no flag).
+            if entry.get("include") is False:
+                continue
             ac, reason = self._aircraft_from_entry(entry)
             if ac is not None:
                 cs = (ac.callsign or "").strip().upper()

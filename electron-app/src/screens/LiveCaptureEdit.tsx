@@ -4,7 +4,7 @@ import { useScenarioStore } from '../state/scenarioStore';
 import { Card, Section, ThemedButton, ThemedInput } from '../components/Themed';
 import { PositionPicker } from '../components/PositionPicker';
 import { useSvgPanZoom } from '../hooks/useSvgPanZoom';
-import type { CaptureFile, CaptureAircraft, SectorGeometry, VnasPosition } from '../../shared/types';
+import type { CaptureFile, CaptureAircraft, SectorGeometry, VnasPosition, AtcConfig } from '../../shared/types';
 
 const W = 560;
 const H = 320;
@@ -23,7 +23,7 @@ function ownerKey(a: CaptureAircraft): string {
 }
 
 export function LiveCaptureEdit() {
-  const { config, update, setScreen } = useScenarioStore();
+  const { config, setScreen } = useScenarioStore();
   const [cap, setCap] = useState<CaptureFile | null>(null);
   const [geom, setGeom] = useState<SectorGeometry[]>([]);
   const [positions, setPositions] = useState<VnasPosition[]>([]);
@@ -31,6 +31,7 @@ export function LiveCaptureEdit() {
   const [routeSectors, setRouteSectors] = useState<Record<string, string[]>>({});
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
+  const [savedAt, setSavedAt] = useState(0);
 
   const [ownerSel, setOwnerSel] = useState<Set<string>>(new Set());
   const [routeSel, setRouteSel] = useState<Set<string>>(new Set());
@@ -73,10 +74,21 @@ export function LiveCaptureEdit() {
       if (!config.captureFile) { setLoading(false); return; }
       const c = await window.ssg.liveCapture.readCapture(config.captureFile);
       if (c) {
-        // Include everything by default now — geofenced neighbor traffic spawns
-        // owned by its own (neighbor) position and gets handed to us in flow.
-        c.aircraft = c.aircraft.map(a => ({ ...a, include: true }));
+        // Honor a saved include flag (from a previously edited/shared capture);
+        // otherwise include everything by default — geofenced neighbor traffic
+        // spawns owned by its own position and gets handed to us in flow.
+        c.aircraft = c.aircraft.map(a => ({ ...a, include: a.include ?? true }));
         setCap(c);
+        // Restore saved edit state so reopening a capture keeps the position
+        // mappings, trainee seat, fallback and handoff toggle.
+        const saved = c.atcConfig;
+        if (saved) {
+          if (typeof saved.enabled === 'boolean') setAtcEnabled(saved.enabled);
+          setOwnerToPosition({ ...(saved.sectorToPosition || {}) });
+          setFallbackPos(saved.fallbackPositionId || '');
+          if (typeof saved.handoffFromTimeline === 'boolean') setHandoffFromTimeline(saved.handoffFromTimeline);
+          setTraineePositions(new Set(saved.traineePositionIds || []));
+        }
         const fac = (c.facility || '').toUpperCase();
         // Local calls (no network) — independent of the positions fetch.
         window.ssg.liveCapture.getSectorGeometry(fac)
@@ -314,65 +326,91 @@ export function LiveCaptureEdit() {
   ]));
   const rosterCount = usedPosIds.length;
 
+  // Build the ATC config from the current mappings/trainee/fallback. sectorToPosition
+  // maps EVERY active "FAC/SEC" (owners + handoff partners) to its position id; the
+  // same set of positions is staffed with ghosts.
+  const buildAtcConfig = (): AtcConfig | undefined => {
+    if (!cap || !atcEnabled) return undefined;
+    const map: Record<string, string> = {};
+    for (const [k, p] of Object.entries(ownerToPosition)) if (p) map[k] = p;
+    const staffSet = new Set<string>();
+    const addKey = (key: string) => {
+      if (key === '/') return;
+      const id = ownerToPosition[key] || matchPosition(key);
+      if (id) { map[key] = id; staffSet.add(id); }
+    };
+    for (const a of included) {
+      addKey(ownerKey(a));
+      for (const h of (a.handoffs || [])) {
+        addKey(`${(h.fromFacility || '').toUpperCase()}/${(h.fromSector || '').toUpperCase()}`);
+        addKey(`${(h.toFacility || '').toUpperCase()}/${(h.toSector || '').toUpperCase()}`);
+      }
+    }
+    for (const id of usedPosIds) staffSet.add(id);
+    const atcEntries = Array.from(staffSet).map(id => {
+      const p = posById(id);
+      // STARS/TRACON positions (terminal, no eram sectorId) auto-track by airport;
+      // ERAM positions take per-aircraft control.
+      const isStars = !!(p && (p.facilityType ? p.facilityType !== 'Artcc' : !p.sectorId));
+      const fid = p?.facilityId || '';
+      return {
+        positionId: id,
+        facilityId: p?.facilityId || p?.artcc || cap.facility || '',
+        artccId: p?.artcc || cap.facility || '',
+        isStars,
+        airports: isStars ? (facilityAirports[fid] || []) : [],
+      };
+    });
+    return {
+      enabled: true,
+      sectorToPosition: map,
+      fallbackPositionId: fallbackPos || null,
+      handoffFromTimeline,
+      traineePositionIds: Array.from(traineePositions),
+      atcEntries,
+    };
+  };
+
+  // The full edited capture — ALL aircraft (carrying include flags + per-aircraft
+  // fixes) plus the atcConfig, so the file is self-contained and re-editable. The
+  // generator skips include===false aircraft.
+  const buildEdited = (): CaptureFile => ({
+    ...(cap as CaptureFile),
+    aircraft: (cap?.aircraft ?? []),
+    atcConfig: buildAtcConfig(),
+  });
+
+  // Persist edits back into the capture file (in place) so they survive reopening
+  // and travel with a shared capture — never lost to a throwaway file.
+  const persist = async (): Promise<boolean> => {
+    if (!cap || !config.captureFile) return false;
+    try {
+      const r = await window.ssg.liveCapture.saveCapture(config.captureFile, buildEdited());
+      if (r?.ok) { setSavedAt(Date.now()); return true; }
+    } catch { /* ignore */ }
+    return false;
+  };
+
   const generate = async () => {
     if (!cap) return;
     setSaving(true);
     try {
-      const edited: CaptureFile = { ...cap, aircraft: included };
-      if (atcEnabled) {
-        // sectorToPosition maps EVERY active "FAC/SEC" (owners + handoff partners)
-        // to its position id, so the replay can target handoffs by position id
-        // (HO {positionId}) for any facility — no adaptation codes needed. The
-        // same set of positions is staffed with ghosts.
-        const map: Record<string, string> = {};
-        for (const [k, p] of Object.entries(ownerToPosition)) if (p) map[k] = p;
-        const staffSet = new Set<string>();
-        const addKey = (key: string) => {
-          if (key === '/') return;
-          const id = ownerToPosition[key] || matchPosition(key);
-          if (id) { map[key] = id; staffSet.add(id); }
-        };
-        for (const a of included) {
-          addKey(ownerKey(a));
-          for (const h of (a.handoffs || [])) {
-            addKey(`${(h.fromFacility || '').toUpperCase()}/${(h.fromSector || '').toUpperCase()}`);
-            addKey(`${(h.toFacility || '').toUpperCase()}/${(h.toSector || '').toUpperCase()}`);
-          }
-        }
-        for (const id of usedPosIds) staffSet.add(id);
-        const staffIds = Array.from(staffSet);
-        const atcEntries = staffIds.map(id => {
-          const p = posById(id);
-          // STARS/TRACON positions (terminal, no eram sectorId) auto-track by
-          // airport; ERAM positions take per-aircraft control.
-          const isStars = !!(p && (p.facilityType ? p.facilityType !== 'Artcc' : !p.sectorId));
-          const fid = p?.facilityId || '';
-          return {
-            positionId: id,
-            facilityId: p?.facilityId || p?.artcc || cap.facility || '',
-            artccId: p?.artcc || cap.facility || '',
-            isStars,
-            // Airports this STARS/TRACON controls — autoTrackAirportIds must be a
-            // subset of these or vNAS rejects it.
-            airports: isStars ? (facilityAirports[fid] || []) : [],
-          };
-        });
-        edited.atcConfig = {
-          enabled: true,
-          sectorToPosition: map,
-          fallbackPositionId: fallbackPos || null,
-          handoffFromTimeline,
-          traineePositionIds: Array.from(traineePositions),
-          atcEntries,
-        };
-      }
-      const path = await window.ssg.liveCapture.writeCapture(edited);
-      update({ captureFile: path });
+      await persist(); // save edits in place; the generator reads this same file
       setScreen('generation');
     } finally {
       setSaving(false);
     }
   };
+
+  // Auto-save edits back to the capture file (debounced) so they're never lost —
+  // reopening the capture, sharing it, or bouncing to the aircraft editor and back
+  // all keep the current mappings/trainee/includes.
+  useEffect(() => {
+    if (loading || !cap || !config.captureFile) return;
+    const t = setTimeout(() => { void persist(); }, 1500);
+    return () => clearTimeout(t);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [cap, ownerToPosition, fallbackPos, traineePositions, handoffFromTimeline, atcEnabled, loading]);
 
   // ── scope ──
   const scopePz = useSvgPanZoom(W, H);
@@ -646,11 +684,17 @@ export function LiveCaptureEdit() {
           {traineePositions.size > 0 ? ` · ${traineePositions.size} trainee seat(s) — handed to you on connect` : ' · no trainee seat selected'}
         </div>
       )}
-      <div className="row" style={{ marginTop: 8, gap: 8, justifyContent: 'space-between' }}>
-        <ThemedButton secondary onClick={() => setScreen('capture')}>← Back</ThemedButton>
-        <ThemedButton onClick={generate} disabled={saving || included.length === 0}>
-          {saving ? 'Preparing…' : `Generate ${included.length} →`}
-        </ThemedButton>
+      <div className="row" style={{ marginTop: 8, gap: 8, justifyContent: 'space-between', alignItems: 'center' }}>
+        <ThemedButton secondary onClick={async () => { await persist(); setScreen('capture'); }}>← Back</ThemedButton>
+        <div className="row" style={{ gap: 8, alignItems: 'center' }}>
+          <span style={{ fontSize: 11, color: 'var(--fg-secondary)' }}>
+            {savedAt ? 'Edits saved to capture ✓' : 'Auto-saves to the capture file'}
+          </span>
+          <ThemedButton secondary onClick={persist}>Save</ThemedButton>
+          <ThemedButton onClick={generate} disabled={saving || included.length === 0}>
+            {saving ? 'Preparing…' : `Generate ${included.length} →`}
+          </ThemedButton>
+        </div>
       </div>
     </Card>
   );
