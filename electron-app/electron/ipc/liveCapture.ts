@@ -1,6 +1,7 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import { spawn, spawnSync, type ChildProcess } from 'node:child_process';
 import * as path from 'node:path';
 import * as fs from 'node:fs/promises';
+import { readFileSync, unlinkSync } from 'node:fs';
 import * as os from 'node:os';
 import { app } from 'electron';
 import { resolveBridgeCommand } from './scenario';
@@ -239,6 +240,30 @@ export function killCapture(): void {
     currentCaptureProc = null;
   }
   currentStopFile = null;
+}
+
+/** Force-kill the SwimServer on quit — SYNCHRONOUSLY, so it's gone before the app
+ *  exits. The Python bridge starts SwimServer with DETACHED_PROCESS, so it is NOT
+ *  our child and Node never reaps it; a lingering SwimServer.exe keeps a lock on
+ *  resources/swimserver/SwimServer.exe, which is exactly what makes the updater's
+ *  installer report "Sweatbox Scenario Generator cannot be closed". We kill the
+ *  tracked PID (%LOCALAPPDATA%\SSG\swimserver.pid) and then sweep any stray by
+ *  image name as a safety net. */
+export function killSwimServer(): void {
+  if (process.platform !== 'win32') {
+    try { spawnSync('pkill', ['-f', 'SwimServer']); } catch { /* best-effort */ }
+    return;
+  }
+  const base = process.env.LOCALAPPDATA || os.homedir();
+  const pidFile = path.join(base, 'SSG', 'swimserver.pid');
+  try {
+    const pid = parseInt(readFileSync(pidFile, 'utf8').trim(), 10);
+    if (pid > 0) spawnSync('taskkill', ['/PID', String(pid), '/T', '/F'], { timeout: 8000 });
+  } catch { /* no pid file / already gone */ }
+  try { unlinkSync(pidFile); } catch { /* ignore */ }
+  // Safety net: an untracked/reused SwimServer.exe (e.g. one we attached to) still
+  // holds the file lock — kill any that remain.
+  try { spawnSync('taskkill', ['/IM', 'SwimServer.exe', '/T', '/F'], { timeout: 8000 }); } catch { /* ignore */ }
 }
 
 /** "End now": touch the stop-file so the running capture finishes gracefully. */

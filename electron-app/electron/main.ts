@@ -6,7 +6,7 @@ import { spawn } from 'node:child_process';
 import { generateScenario } from './ipc/scenario';
 import { listAirports } from './ipc/airports';
 import { uploadScenario, resetVnasSession, clearVnasCookies, dumpScenario } from './ipc/vnas';
-import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors, killCapture } from './ipc/liveCapture';
+import { saveCredentials, loadCredentials, startCapture, stopCapture, connect, disconnect, serverStatus, getSectorGeometry, getPositions, getRouteSectors, killCapture, killSwimServer } from './ipc/liveCapture';
 import type {
   ScenarioConfig,
   SwimCredentialsInput,
@@ -316,8 +316,11 @@ app.on('before-quit', () => {
   // Kill any running capture child first so it isn't orphaned (orphans keep
   // streaming progress and double up the next run).
   killCapture();
-  // Best-effort: stop the warm SwimServer so it doesn't linger after SSG exits.
-  disconnect().catch(() => {});
+  // Kill the detached SwimServer SYNCHRONOUSLY. It isn't our child, so if we let
+  // it linger it keeps a lock on resources/swimserver/SwimServer.exe and the
+  // updater's installer can't replace SSG ("cannot be closed"). Must be sync —
+  // an async disconnect() spawns a bridge that won't finish before we exit.
+  killSwimServer();
 });
 
 app.on('window-all-closed', () => {
