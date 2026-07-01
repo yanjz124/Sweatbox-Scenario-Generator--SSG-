@@ -257,10 +257,12 @@ class LiveReplayScenario:
             r = re.sub(r"/[A-Za-z0-9]+", "", r or "")
             return re.sub(r"[./]+", " ", r).strip()
 
-        # Score each candidate route and keep the best. A route that actually REACHES
-        # the destination wins — so the arrival's STAR + airport are present — over a
-        # truncated filed route (SWIM's originalRoute is often clipped, e.g.
-        # "KSAV..MARCL"); more resolvable fixes breaks the tie.
+        # Score each candidate route and keep the FULLEST. SWIM gives two: `route`
+        # is the clipped remaining leg (e.g. "LFK..VLKNN") and `originalRoute` is the
+        # full filed route (e.g. "KAUS..…LFK..SUTTN") — usually the more complete of
+        # the two. So rank by resolvable-fix count first (the fuller route wins), and
+        # only break ties by whether it reaches the destination (STAR + airport). The
+        # navigationPath is built from the spawn onward, so upstream fixes don't hurt.
         best = None  # (score, norm, coords)
         for raw in (fp.get("originalRoute"), fp.get("route")):
             norm = _norm(raw)
@@ -269,7 +271,7 @@ class LiveReplayScenario:
             coords = self.route_parser.get_route_waypoint_coordinates(
                 self.route_parser.parse_route_string(norm))
             reaches = 1 if (destination and destination in norm.split()) else 0
-            score = (reaches, len(coords))
+            score = (len(coords), reaches)
             if best is None or score > best[0]:
                 best = (score, norm, coords)
         if best is None:
