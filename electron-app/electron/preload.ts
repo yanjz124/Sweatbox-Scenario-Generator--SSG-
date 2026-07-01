@@ -54,6 +54,7 @@ contextBridge.exposeInMainWorld('ssg', {
     readCapture: (filePath: string) => ipcRenderer.invoke('liveCapture:readCapture', filePath),
     writeCapture: (data: unknown) => ipcRenderer.invoke('liveCapture:writeCapture', data),
     saveCapture: (filePath: string, data: unknown) => ipcRenderer.invoke('liveCapture:saveCapture', filePath, data),
+    previewReplay: (captureFile: string) => ipcRenderer.invoke('liveCapture:previewReplay', captureFile),
     deleteCapture: (filePath: string) => ipcRenderer.invoke('liveCapture:deleteCapture', filePath),
     startCapture: (req: CaptureRequest): Promise<CaptureResult> =>
       ipcRenderer.invoke('liveCapture:startCapture', req),

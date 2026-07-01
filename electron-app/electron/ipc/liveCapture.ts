@@ -10,6 +10,7 @@ import type {
   SwimCredentialsStatus,
   CaptureRequest,
   CaptureResult,
+  ReplayPreviewRow,
 } from '../../shared/types';
 
 export interface CaptureProgress {
@@ -166,6 +167,12 @@ export async function getRouteSectors(
   captureFile: string,
 ): Promise<{ status: string; routeSectors?: Record<string, string[]>; message?: string }> {
   return runBridgeAction({ action: 'route_sectors', facility, captureFile });
+}
+
+export async function previewReplay(
+  captureFile: string,
+): Promise<{ status: string; aircraft?: ReplayPreviewRow[]; studentPositionId?: string | null; message?: string }> {
+  return runBridgeAction({ action: 'preview_replay', captureFile });
 }
 
 export async function connect(): Promise<{

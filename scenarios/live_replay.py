@@ -248,18 +248,6 @@ class LiveReplayScenario:
         departure = _icao_airport(fp.get("departure"))
         destination = _icao_airport(fp.get("destination"))
 
-        # Prefer the route that keeps procedure names (SID/STAR/airways) over the
-        # one expanded to bare fixes — the filed originalRoute usually wins (fewer
-        # ".." direct-to segments) — but fall back to the OTHER route if the
-        # preferred one resolves to nothing (a sparse airport-only originalRoute
-        # would otherwise drop an aircraft whose active route has real fixes).
-        route_active = (fp.get("route") or "").strip()
-        route_filed = (fp.get("originalRoute") or "").strip()
-        if route_filed and (not route_active or route_filed.count("..") < route_active.count("..")):
-            ordered = [route_filed, route_active]
-        else:
-            ordered = [route_active, route_filed]
-
         def _norm(r: str) -> str:
             # Strip SWIM per-token suffixes — "/TIME" (KPIT/0544) or "/speed-alt"
             # (FIX/N0450F350) — matching ONLY the alnum run after a '/', so the FAA
@@ -269,20 +257,24 @@ class LiveReplayScenario:
             r = re.sub(r"/[A-Za-z0-9]+", "", r or "")
             return re.sub(r"[./]+", " ", r).strip()
 
-        route_str, route_coords = "", []
-        for raw in ordered:
+        # Score each candidate route and keep the best. A route that actually REACHES
+        # the destination wins — so the arrival's STAR + airport are present — over a
+        # truncated filed route (SWIM's originalRoute is often clipped, e.g.
+        # "KSAV..MARCL"); more resolvable fixes breaks the tie.
+        best = None  # (score, norm, coords)
+        for raw in (fp.get("originalRoute"), fp.get("route")):
             norm = _norm(raw)
             if not norm:
                 continue
-            if not route_str:
-                route_str = norm  # first parseable string wins the display route
             coords = self.route_parser.get_route_waypoint_coordinates(
                 self.route_parser.parse_route_string(norm))
-            if coords:
-                route_str, route_coords = norm, coords  # the one that actually resolves
-                break
-        if not route_str:
+            reaches = 1 if (destination and destination in norm.split()) else 0
+            score = (reaches, len(coords))
+            if best is None or score > best[0]:
+                best = (score, norm, coords)
+        if best is None:
             return None, "no_route"
+        route_str, route_coords = best[1], best[2]
 
         if not route_coords:
             # No enroute fix resolved (short airport-to-airport GA routes). Anchor
@@ -299,7 +291,7 @@ class LiveReplayScenario:
         if not frd:
             return None, "no_frd"
 
-        nav_path = self._downstream_route(route_coords, lat, lon, destination)
+        nav_path = self._downstream_route(route_coords, lat, lon, destination, tokens=route_str.split())
 
         # Never fake the aircraft type — skip if SWIM hadn't published it yet
         # (the editor can set it to recover the aircraft).
@@ -608,30 +600,47 @@ class LiveReplayScenario:
         return f"{aircraft_type}/L"
 
     def _downstream_route(self, route_coords, lat: float, lon: float,
-                          destination: str) -> str:
-        """Build the navigationPath: route fixes from the next one ahead of the
-        aircraft to the end, then the destination.
+                          destination: str, tokens: Optional[List[str]] = None) -> str:
+        """Build the navigationPath: the route AHEAD of the aircraft, ending at the
+        destination.
 
-        The "next fix" is the end of the route segment the aircraft is currently
-        on, found by projecting its position onto each segment (equirectangular
-        approximation, fine at sector scale)."""
+        The "next fix" is the end of the route segment the aircraft is currently on,
+        found by projecting its position onto each segment. When the raw route
+        ``tokens`` are supplied we keep them (fixes AND airway/SID/STAR names, which
+        vNAS expands) from that fix onward — otherwise an arrival would fly direct to
+        the airport with its STAR dropped. Falls back to resolved fixes only when a
+        token can't be matched."""
         n = len(route_coords)
         if n == 0:
             return destination or ""
-        if n == 1:
-            # Only one resolvable fix — we can't tell if it's ahead or behind,
-            # so route direct to the destination (the FRD already fixes the
-            # spawn position). Avoids turning back to a fix behind the aircraft.
-            return destination or route_coords[0][0]
-
-        next_idx = self._next_fix_index(route_coords, lat, lon)
+        next_idx = self._next_fix_index(route_coords, lat, lon) if n >= 2 else n
+        anchor = route_coords[next_idx][0] if next_idx < n else route_coords[-1][0]
+        # Locate the anchor among the raw tokens. A procedure fix resolves without its
+        # numeric suffix (JIIMS4 -> JIIMS, RAVNN9 -> RAVNN), so match by prefix too.
+        ti = -1
+        if tokens:
+            if anchor in tokens:
+                ti = tokens.index(anchor)
+            else:
+                for i, t in enumerate(tokens):
+                    if t.startswith(anchor) or anchor.startswith(t):
+                        ti = i
+                        break
+        if ti >= 0:
+            # Keep the real route tail (procedures/airways included) from the next
+            # fix onward; when we're past the last resolved fix, start just after it
+            # so a trailing STAR (unresolved procedure name) is still flown.
+            start = ti + (0 if next_idx < n else 1)
+            tail = [t for t in tokens[start:] if t != destination]
+            if destination:
+                tail.append(destination)
+            nav = " ".join(tail).strip()
+            if nav:
+                return nav
         names = [nm for nm, _, _ in route_coords[next_idx:]]
-        # Append the destination, unless it's already the last fix (airport-anchored
-        # routes carry the airport in route_coords, which would double it).
         if destination and (not names or names[-1] != destination):
             names.append(destination)
-        nav = " ".join(names).strip()
-        return nav or destination or ""
+        return " ".join(names).strip() or destination or ""
 
     @staticmethod
     def _next_fix_index(route_coords, lat: float, lon: float) -> int:

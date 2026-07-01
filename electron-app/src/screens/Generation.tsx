@@ -76,6 +76,67 @@ export function Generation() {
     };
   }, [config, importedScenario]);
 
+  // Export every aircraft to a spreadsheet (CSV — opens directly in Excel): flight
+  // plan, spawn, ownership (resolved to sector via the capture's mappings), the
+  // auto-issued commands, scratchpad, timing. One row per aircraft.
+  const exportCsv = async () => {
+    if (!result?.contents) return;
+    let sj: any;
+    try { sj = JSON.parse(result.contents); } catch { return; }
+    const acs: any[] = sj.aircraft || [];
+    const atc = new Map<string, any>((sj.atc || []).map((e: any) => [e.positionId, e]));
+    const student: string | undefined = sj.studentPositionId;
+
+    // positionId -> the captured FAC/SEC(s) mapped to it, for readable ownership.
+    const ownerSecs = new Map<string, string[]>();
+    try {
+      if (config.captureFile) {
+        const cap = await window.ssg.liveCapture.readCapture(config.captureFile);
+        for (const [k, pid] of Object.entries(cap?.atcConfig?.sectorToPosition || {})) {
+          if (!pid) continue;
+          const arr = ownerSecs.get(pid as string) || [];
+          arr.push(k);
+          ownerSecs.set(pid as string, arr);
+        }
+      }
+    } catch { /* fall back to facility below */ }
+    const ownerText = (pid?: string): string => {
+      if (!pid) return '(unowned)';
+      const secs = ownerSecs.get(pid);
+      const fac = atc.get(pid)?.facilityId;
+      const base = secs?.length ? secs.join(' + ') : (fac ? `${fac} …${pid.slice(-4)}` : pid);
+      return pid === student ? `${base} (STUDENT)` : base;
+    };
+
+    const cols = [
+      'Callsign', 'Type', 'Rules', 'Departure', 'Destination', 'Cruise Alt', 'Route',
+      'Spawn Fix', 'Spawn Alt', 'Spawn Speed', 'Nav Path',
+      'Owner', 'Owner Facility', 'Handoff to Student (s)', 'Commands', 'Scratchpad', 'Spawn Delay (s)',
+    ];
+    const rows = acs.map(a => {
+      const sc = a.startingConditions || {};
+      const fp = a.flightplan || {};
+      const tc = a.autoTrackConditions || {};
+      return [
+        a.aircraftId, a.aircraftType, fp.rules, fp.departure, fp.destination, fp.cruiseAltitude, fp.route,
+        sc.fix, sc.altitude, sc.speed ?? sc.mach ?? '', sc.navigationPath,
+        ownerText(tc.positionId), atc.get(tc.positionId)?.facilityId ?? '',
+        tc.handoffDelay ?? '',
+        (a.presetCommands || []).map((c: any) => c.command).join(' | '),
+        tc.scratchPad ?? '',
+        a.spawnDelay ?? 0,
+      ];
+    });
+    const esc = (v: any) => {
+      const s = v == null ? '' : String(v);
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    // Prepend a BOM so Excel reads UTF-8 correctly.
+    const csv = '﻿' + [cols, ...rows].map(r => r.map(esc).join(',')).join('\r\n');
+    const base = (result.filename || 'scenario').replace(/\.json$/i, '');
+    await window.ssg.fs.saveScenario(`${base}-aircraft.csv`, csv);
+  };
+
   return (
     <Card title={isImported ? 'Loaded Scenario' : 'Generated Scenario'}>
       {loading && (
@@ -218,6 +279,9 @@ export function Generation() {
               onClick={() => window.ssg.fs.saveScenario(result.filename, result.contents)}
             >
               Save…
+            </ThemedButton>
+            <ThemedButton secondary onClick={exportCsv}>
+              Export to Excel (CSV)
             </ThemedButton>
             {!isImported && (
               config.scenarioType === 'live_replay'

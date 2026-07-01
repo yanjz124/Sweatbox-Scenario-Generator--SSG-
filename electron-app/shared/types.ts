@@ -361,6 +361,27 @@ export interface CaptureFile {
   [k: string]: unknown;
 }
 
+/** Per-aircraft summary from a live-replay preview (what the generator would emit):
+ *  flight plan, spawn, ownership and the auto-issued "prefile" commands. */
+export interface ReplayPreviewRow {
+  callsign: string;
+  type: string;
+  rules?: string;
+  departure?: string;
+  destination?: string;
+  cruiseAltitude?: string | number | null;
+  route?: string;
+  spawnFix?: string;
+  spawnAlt?: number;
+  spawnSpeed?: number;
+  navPath?: string;
+  ownerPositionId?: string | null;
+  handoffDelay?: number | null;
+  commands: string[];
+  scratchpad?: string | null;
+  spawnDelay?: number | null;
+}
+
 export interface GenerationStats {
   requested_total: number;
   actual_total: number;
@@ -439,6 +460,7 @@ declare global {
         readCapture(filePath: string): Promise<CaptureFile | null>;
         writeCapture(data: CaptureFile): Promise<string>;
         saveCapture(filePath: string, data: CaptureFile): Promise<{ ok: boolean; path?: string; message?: string }>;
+        previewReplay(captureFile: string): Promise<{ status: string; aircraft?: ReplayPreviewRow[]; studentPositionId?: string | null; message?: string }>;
         deleteCapture(filePath: string): Promise<{ ok: boolean; message?: string }>;
         startCapture(req: CaptureRequest): Promise<CaptureResult>;
         stopCapture(): Promise<{ stopped: boolean }>;

@@ -4,7 +4,7 @@ import { useScenarioStore } from '../state/scenarioStore';
 import { Card, Section, ThemedButton, ThemedInput } from '../components/Themed';
 import { PositionPicker } from '../components/PositionPicker';
 import { useSvgPanZoom } from '../hooks/useSvgPanZoom';
-import type { CaptureFile, CaptureAircraft, SectorGeometry, VnasPosition, AtcConfig } from '../../shared/types';
+import type { CaptureFile, CaptureAircraft, SectorGeometry, VnasPosition, AtcConfig, ReplayPreviewRow } from '../../shared/types';
 
 const W = 560;
 const H = 320;
@@ -32,6 +32,9 @@ export function LiveCaptureEdit() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savedAt, setSavedAt] = useState(0);
+  // Per-callsign preview of what the generator would emit (prefile commands etc.).
+  const [preview, setPreview] = useState<Record<string, ReplayPreviewRow>>({});
+  const [previewing, setPreviewing] = useState(false);
 
   const [ownerSel, setOwnerSel] = useState<Set<string>>(new Set());
   const [routeSel, setRouteSel] = useState<Set<string>>(new Set());
@@ -402,6 +405,56 @@ export function LiveCaptureEdit() {
     }
   };
 
+  // Run the generator on the (saved) capture to preview each aircraft's prefile
+  // commands + resolved ownership, keyed by callsign. Persists first so it reflects
+  // the current edits. Returns the map (also stored in state for the table).
+  const runPreview = async (): Promise<Record<string, ReplayPreviewRow>> => {
+    if (!cap || !config.captureFile) return {};
+    setPreviewing(true);
+    try {
+      await persist();
+      const r = await window.ssg.liveCapture.previewReplay(config.captureFile);
+      const m: Record<string, ReplayPreviewRow> = {};
+      if (r.status === 'ok' && r.aircraft) {
+        for (const row of r.aircraft) m[(row.callsign || '').toUpperCase()] = row;
+      }
+      setPreview(m);
+      return m;
+    } finally {
+      setPreviewing(false);
+    }
+  };
+
+  // Export every aircraft to a spreadsheet (CSV — opens in Excel): flight plan,
+  // ownership, spawn, and the auto-issued PREFILE COMMANDS. Runs a fresh preview so
+  // the commands are current.
+  const exportCsv = async () => {
+    if (!cap) return;
+    const pv = await runPreview();
+    const cols = [
+      'Include', 'Callsign', 'Type', 'Rules', 'Departure', 'Destination', 'Cruise Alt', 'Route',
+      'Owner (FAC/SEC)', 'Position', 'Trainee', 'Spawn Offset (s)', 'Spawn Fix', 'Spawn Alt',
+      'Handoff to Student (s)', 'Prefile Commands', 'Scratchpad',
+    ];
+    const rows = aircraft.map(a => {
+      const p = pv[(a.callsign || '').toUpperCase()];
+      const o = ownerOf(a);
+      return [
+        a.include ? 'yes' : 'no', a.callsign, a.aircraftType, a.flightRules ?? '',
+        a.flightplan.departure, a.flightplan.destination, a.flightplan.cruiseAltitudeFt, a.flightplan.route,
+        ownerKey(a), o.label, o.trainee ? 'yes' : '', a.firstSeenOffsetSec,
+        p?.spawnFix ?? '', p?.spawnAlt ?? '', p?.handoffDelay ?? '',
+        (p?.commands || []).join(' | '), p?.scratchpad ?? '',
+      ];
+    });
+    const esc = (v: unknown) => {
+      const s = v == null ? '' : String(v);
+      return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+    };
+    const csv = '﻿' + [cols, ...rows].map(r => r.map(esc).join(',')).join('\r\n');
+    await window.ssg.fs.saveScenario(`${cap.facility || 'capture'}-aircraft.csv`, csv);
+  };
+
   // Auto-save edits back to the capture file (debounced) so they're never lost —
   // reopening the capture, sharing it, or bouncing to the aircraft editor and back
   // all keep the current mappings/trainee/includes.
@@ -566,6 +619,11 @@ export function LiveCaptureEdit() {
           <ThemedButton secondary onClick={() => setAll(true)}>Include all</ThemedButton>
           <ThemedButton secondary onClick={() => setAll(false)}>Include none</ThemedButton>
           <ThemedButton secondary onClick={removeNonTouching}>Remove not entering {ourFac}</ThemedButton>
+          <span style={{ flex: 1 }} />
+          <ThemedButton secondary onClick={runPreview} disabled={previewing}>
+            {previewing ? 'Previewing…' : 'Preview commands'}
+          </ThemedButton>
+          <ThemedButton secondary onClick={exportCsv} disabled={previewing}>Export to Excel (CSV)</ThemedButton>
         </div>
         {activeOwners.length > 0 && (
           <div style={{ marginTop: 8 }}>
@@ -650,6 +708,7 @@ export function LiveCaptureEdit() {
               <th style={cell}></th><th style={cell}>Callsign</th><th style={cell}>Type</th>
               <th style={cell}>Dep→Dest</th><th style={cell}>Alt</th><th style={cell}>Spawn(s)</th>
               <th style={cell}>Owns</th><th style={cell}>Pos</th><th style={cell}>Route</th>
+              <th style={cell}>Prefile commands</th>
             </tr>
           </thead>
           <tbody>
@@ -669,6 +728,10 @@ export function LiveCaptureEdit() {
                   <td style={{ ...cell, color: 'var(--fg-secondary)', whiteSpace: 'nowrap' }}>{ownerKey(a)}</td>
                   <td style={{ ...cell, whiteSpace: 'nowrap', color: o.trainee ? 'var(--accent, #3b82f6)' : 'var(--fg-secondary)' }}>{o.label}{o.trainee ? ' ★' : ''}</td>
                   <td style={cell}><ThemedInput style={{ width: 200 }} value={a.flightplan.route ?? ''} onChange={e => setFp(i, { route: e.target.value })} /></td>
+                  <td style={{ ...cell, whiteSpace: 'nowrap', fontFamily: 'monospace', color: 'var(--accent, #8ab4f8)' }}>
+                    {(preview[(a.callsign || '').toUpperCase()]?.commands || []).join('   ')
+                      || (previewing ? '…' : '')}
+                  </td>
                 </tr>
               );
             })}

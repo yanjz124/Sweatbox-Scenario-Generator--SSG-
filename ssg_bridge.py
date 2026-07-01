@@ -785,6 +785,42 @@ def _action_capture(cfg, logger):
     }
 
 
+def _action_preview_replay(cfg, logger):
+    """Run the live-replay generator on a capture and return a per-aircraft summary
+    (flight plan, spawn, ownership, the auto-issued 'prefile' commands, timing) so
+    the editor can SHOW and export the commands without a full scenario build."""
+    from scenarios.live_replay import LiveReplayScenario
+    capture_file = cfg.get('captureFile')
+    if not capture_file or not Path(capture_file).is_file():
+        return {'status': 'error', 'message': 'capture file not found'}
+    try:
+        sc = LiveReplayScenario.from_file(capture_file)
+        acs = sc.generate()
+    except Exception as e:  # noqa: BLE001
+        return {'status': 'error', 'message': str(e)}
+    rows = []
+    for a in acs:
+        rows.append({
+            'callsign': a.callsign,
+            'type': a.aircraft_type,
+            'rules': a.flight_rules,
+            'departure': a.departure,
+            'destination': a.arrival,
+            'cruiseAltitude': a.cruise_altitude,
+            'route': a.route,
+            'spawnFix': a.fix,
+            'spawnAlt': a.altitude,
+            'spawnSpeed': a.ground_speed,
+            'navPath': a.navigation_path,
+            'ownerPositionId': getattr(a, 'auto_track_position_id', None),
+            'handoffDelay': getattr(a, 'auto_track_handoff_delay', None),
+            'commands': list(getattr(a, 'preset_commands', None) or []),
+            'scratchpad': getattr(a, 'auto_track_scratchpad', None),
+            'spawnDelay': a.spawn_delay,
+        })
+    return {'status': 'ok', 'aircraft': rows, 'studentPositionId': sc.student_position_id}
+
+
 def _action_route_sectors(cfg, logger):
     """For each captured aircraft, compute which KML sectors its filed route
     passes through (lateral + altitude band). Powers the editor's
@@ -1067,6 +1103,9 @@ def main(config_path):
         return
     if action == 'route_sectors':
         print(json.dumps(_action_route_sectors(cfg, logger)))
+        return
+    if action == 'preview_replay':
+        print(json.dumps(_action_preview_replay(cfg, logger)))
         return
 
     aircraft, artcc_id = dispatch(cfg)
