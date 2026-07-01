@@ -501,9 +501,9 @@ export function LiveCaptureEdit() {
         )}
       </Section>
 
-      {/* 2. trainee positions */}
+      {/* 2. trainee position (the single seat you sign into) */}
       {atcEnabled && usedPosIds.length > 0 && (
-        <Section title="2. Trainee position(s) — you work these">
+        <Section title="2. Trainee position — the seat you sign into">
           <div style={{ maxHeight: 140, overflow: 'auto' }}>
             {byFacility(Object.entries(usedPosIds.reduce((acc, id) => {
               const p = posById(id);
@@ -517,8 +517,12 @@ export function LiveCaptureEdit() {
                   const p = posById(id);
                   const label = p ? `${p.sectorId ? `${p.sectorId} ` : ''}${p.name || p.callsign || id}` : id;
                   return (
+                    // Single-select: exactly one position is THE student seat
+                    // (studentPositionId). Clicking picks it and clears any other,
+                    // so a stale second selection can't silently become the seat.
                     <span key={id} style={chip(traineePositions.has(id))}
-                      onClick={() => toggle(traineePositions, setTraineePositions, id)}>{label}</span>
+                      onClick={() => setTraineePositions(prev =>
+                        prev.has(id) ? new Set() : new Set([id]))}>{label}</span>
                   );
                 })}
               </div>
@@ -529,7 +533,9 @@ export function LiveCaptureEdit() {
             Auto-handoff timing from captured handoffs (non-trainee positions)
           </label>
           <p style={{ fontSize: 11, color: 'var(--fg-secondary)', margin: '4px 0 0' }}>
-            Auto-handoff (in & out) is disabled for the trainee position(s) — you do your own. Capture data is preserved.
+            Pick the one position you'll work (combine its sectors in step 1). Auto-handoff
+            in/out is disabled for it — you do your own — and the captured handoffs into it
+            flash to you at their real times. Everything else is owned by ghosts.
           </p>
         </Section>
       )}
