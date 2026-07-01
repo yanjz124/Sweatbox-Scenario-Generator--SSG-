@@ -217,9 +217,15 @@ class LiveReplayScenario:
             route_str = route_filed
         else:
             route_str = route_active
-        # SWIM annotates tokens with "/TIME" or "/speed-alt" (e.g. "KDAL/1945",
-        # "FIX/N0450F350") — strip them so route fixes + the destination parse.
-        route_str = re.sub(r"/\S+", "", route_str).strip()
+        # Strip SWIM per-token suffixes — "/TIME" (KPIT/0544) or "/speed-alt"
+        # (FIX/N0450F350) — matching ONLY the alnum run after a '/', so the FAA
+        # "./." route connector isn't consumed. (The old "/\S+" ate everything to
+        # the end on dot-compact routes that have no spaces.)
+        route_str = re.sub(r"/[A-Za-z0-9]+", "", route_str)
+        # Normalize FAA dot-compact separators ('.', '..' direct) to spaces so the
+        # parser sees discrete tokens: "KTPA./.CRG302047..RYCKI.Q69.RICCS" →
+        # "KTPA CRG302047 RYCKI Q69 RICCS". Space-separated routes are unaffected.
+        route_str = re.sub(r"[./]+", " ", route_str).strip()
         if not route_str:
             return None, "no_route"
 
