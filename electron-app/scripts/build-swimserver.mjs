@@ -13,6 +13,10 @@
  * runtime files). electron-builder copies this whole dir to
  * resources/swimserver/ (see electron-builder.yml), where the bridge's
  * resource_path('swimserver', 'SwimServer.exe') resolves it.
+ *
+ * The ERAM scope's KML video maps (AllSectors.kml, etc.) ride along: SwimServer's
+ * csproj copies them next to the exe on publish and resolves them from the app base
+ * dir, so the map works in this bundled build (no .git-anchored repo root here).
  */
 import { spawn } from 'node:child_process';
 import { existsSync } from 'node:fs';
