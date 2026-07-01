@@ -62,6 +62,35 @@ def _ulid() -> str:
     return head + tail
 
 
+import functools
+
+
+@functools.lru_cache(maxsize=1024)
+def _airport_refpoint(icao: str):
+    """(lat, lon) of an airport's FAA CIFP reference point — used to anchor a spawn
+    on short airport-to-airport GA routes that have no resolvable enroute fix.
+    Returns None if the airport isn't found (or the CIFP is unavailable)."""
+    icao = (icao or "").strip().upper()
+    if not (len(icao) == 4 and icao.isalpha()):
+        return None
+    try:
+        from utils.data_pipeline.cifp_index import DEFAULT_CIFP_PATH
+        prefix = f"SUSAP {icao}"
+        with open(DEFAULT_CIFP_PATH, encoding="latin-1") as f:
+            for ln in f:
+                # Airport reference-point record: section 'P', subsection 'A'.
+                if ln.startswith(prefix) and ln[12:13] == "A":
+                    m = re.search(r"([NS])(\d{2})(\d{2})(\d{4})([EW])(\d{3})(\d{2})(\d{4})", ln)
+                    if m:
+                        la = int(m.group(2)) + int(m.group(3)) / 60 + int(m.group(4)) / 360000
+                        lo = int(m.group(6)) + int(m.group(7)) / 60 + int(m.group(8)) / 360000
+                        return (-la if m.group(1) == "S" else la,
+                                -lo if m.group(5) == "W" else lo)
+    except (OSError, ValueError):
+        return None
+    return None
+
+
 def _icao_airport(code) -> str:
     """Coerce a flight-plan endpoint to a vNAS-acceptable ICAO airport (exactly
     four letters). 3-letter US codes get a 'K' prefix; anything with digits or
@@ -208,41 +237,63 @@ class LiveReplayScenario:
         if lat is None or lon is None:
             return None, "no_position"
 
+        # vNAS / data-admin requires dep & dest to be real ICAO airports — drop
+        # FAA LIDs / fixes / DMEs to '' (they block the whole scenario save).
+        # Coerced up front so the airport-anchor fallback below can use them.
+        departure = _icao_airport(fp.get("departure"))
+        destination = _icao_airport(fp.get("destination"))
+
         # Prefer the route that keeps procedure names (SID/STAR/airways) over the
-        # one expanded to bare fixes — the filed originalRoute usually wins, but
-        # not always, so pick the one with fewer ".." direct-to segments.
+        # one expanded to bare fixes — the filed originalRoute usually wins (fewer
+        # ".." direct-to segments) — but fall back to the OTHER route if the
+        # preferred one resolves to nothing (a sparse airport-only originalRoute
+        # would otherwise drop an aircraft whose active route has real fixes).
         route_active = (fp.get("route") or "").strip()
         route_filed = (fp.get("originalRoute") or "").strip()
         if route_filed and (not route_active or route_filed.count("..") < route_active.count("..")):
-            route_str = route_filed
+            ordered = [route_filed, route_active]
         else:
-            route_str = route_active
-        # Strip SWIM per-token suffixes — "/TIME" (KPIT/0544) or "/speed-alt"
-        # (FIX/N0450F350) — matching ONLY the alnum run after a '/', so the FAA
-        # "./." route connector isn't consumed. (The old "/\S+" ate everything to
-        # the end on dot-compact routes that have no spaces.)
-        route_str = re.sub(r"/[A-Za-z0-9]+", "", route_str)
-        # Normalize FAA dot-compact separators ('.', '..' direct) to spaces so the
-        # parser sees discrete tokens: "KTPA./.CRG302047..RYCKI.Q69.RICCS" →
-        # "KTPA CRG302047 RYCKI Q69 RICCS". Space-separated routes are unaffected.
-        route_str = re.sub(r"[./]+", " ", route_str).strip()
+            ordered = [route_active, route_filed]
+
+        def _norm(r: str) -> str:
+            # Strip SWIM per-token suffixes — "/TIME" (KPIT/0544) or "/speed-alt"
+            # (FIX/N0450F350) — matching ONLY the alnum run after a '/', so the FAA
+            # "./." route connector isn't consumed (the old "/\S+" ate to the end on
+            # dot-compact routes). Then normalize '.'/'..' separators to spaces:
+            # "KTPA./.CRG302047..RYCKI.Q69.RICCS" → "KTPA CRG302047 RYCKI Q69 RICCS".
+            r = re.sub(r"/[A-Za-z0-9]+", "", r or "")
+            return re.sub(r"[./]+", " ", r).strip()
+
+        route_str, route_coords = "", []
+        for raw in ordered:
+            norm = _norm(raw)
+            if not norm:
+                continue
+            if not route_str:
+                route_str = norm  # first parseable string wins the display route
+            coords = self.route_parser.get_route_waypoint_coordinates(
+                self.route_parser.parse_route_string(norm))
+            if coords:
+                route_str, route_coords = norm, coords  # the one that actually resolves
+                break
         if not route_str:
             return None, "no_route"
 
-        waypoints = self.route_parser.parse_route_string(route_str)
-        route_coords = self.route_parser.get_route_waypoint_coordinates(waypoints)
         if not route_coords:
-            # Can't anchor an FRD without at least one resolvable route fix.
+            # No enroute fix resolved (short airport-to-airport GA routes). Anchor
+            # the spawn off the departure/destination airport reference point so
+            # the aircraft still loads instead of being dropped as "no_frd".
+            for icao in (departure, destination):
+                c = _airport_refpoint(icao)
+                if c:
+                    route_coords.append((icao, c[0], c[1]))
+        if not route_coords:
             return None, "no_frd"
 
         frd = self.route_parser.generate_frd_position(lat, lon, route_coords)
         if not frd:
             return None, "no_frd"
 
-        # vNAS / data-admin requires dep & dest to be real ICAO airports — drop
-        # FAA LIDs / fixes / DMEs to '' (they block the whole scenario save).
-        departure = _icao_airport(fp.get("departure"))
-        destination = _icao_airport(fp.get("destination"))
         nav_path = self._downstream_route(route_coords, lat, lon, destination)
 
         # Never fake the aircraft type — skip if SWIM hadn't published it yet
@@ -570,7 +621,9 @@ class LiveReplayScenario:
 
         next_idx = self._next_fix_index(route_coords, lat, lon)
         names = [nm for nm, _, _ in route_coords[next_idx:]]
-        if destination:
+        # Append the destination, unless it's already the last fix (airport-anchored
+        # routes carry the airport in route_coords, which would double it).
+        if destination and (not names or names[-1] != destination):
             names.append(destination)
         nav = " ".join(names).strip()
         return nav or destination or ""
