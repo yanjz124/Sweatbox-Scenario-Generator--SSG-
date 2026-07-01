@@ -2,6 +2,7 @@ import type React from 'react';
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { useScenarioStore } from '../state/scenarioStore';
 import { Card, Section, ThemedButton, ThemedInput } from '../components/Themed';
+import { PositionPicker } from '../components/PositionPicker';
 import { useSvgPanZoom } from '../hooks/useSvgPanZoom';
 import type { CaptureFile, CaptureAircraft, SectorGeometry, VnasPosition } from '../../shared/types';
 
@@ -187,6 +188,11 @@ export function LiveCaptureEdit() {
     for (const [l, id] of labelToId) m.set(id, l);
     return m;
   }, [labelToId]);
+  // Options for the searchable PositionPicker combobox (id + display label).
+  const posOptions = useMemo(
+    () => Array.from(idToLabel, ([id, label]) => ({ id, label })),
+    [idToLabel],
+  );
   const posById = (id: string) => positions.find(p => p.id === id);
   // Resolve an owner/handoff "FAC/SEC" key to a vNAS position id: ERAM by eram
   // sectorId, else the facility's approach (TRACON). '' if none.
@@ -214,14 +220,6 @@ export function LiveCaptureEdit() {
     const f = p.facilityId || p.facility || '';
     return `${f}${p.sectorId ? `/${p.sectorId}` : ''} ${p.name || p.callsign || id}`.trim();
   };
-  // Positions in active use (what a fallback should pick from) — the working
-  // sectors owners are mapped to, plus the current fallback.
-  const mappedPositions = useMemo(() => {
-    const s = new Set(Object.values(ownerToPosition).filter(Boolean));
-    if (fallbackPos) s.add(fallbackPos);
-    return Array.from(s).sort((a, b) => posLabel(a).localeCompare(posLabel(b)));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [ownerToPosition, fallbackPos, positions]);
 
   const setInclude = (pred: (a: CaptureAircraft) => boolean) =>
     setCap(c => (c ? { ...c, aircraft: c.aircraft.map(a => ({ ...a, include: pred(a) })) } : c));
@@ -421,11 +419,6 @@ export function LiveCaptureEdit() {
 
   return (
     <Card title={`Edit Capture — ${cap.facility ?? ''} (${included.length}/${aircraft.length} included)`}>
-      {/* shared position datalist (rendered once) */}
-      <datalist id="ssg-positions">
-        {Array.from(labelToId.keys()).map(l => <option key={l} value={l} />)}
-      </datalist>
-
       {/* 1. combine owners → positions */}
       <Section title="1. Positions — combine sectors">
         <label className="row" style={{ gap: 8, alignItems: 'center', fontSize: 13 }}>
@@ -449,25 +442,14 @@ export function LiveCaptureEdit() {
             </div>
             <label className="row" style={{ gap: 8, alignItems: 'center', fontSize: 12 }}>
               Fallback (unmatched owners):
-              <select className="themed" style={{ minWidth: 240 }}
+              <PositionPicker
                 value={fallbackPos}
-                onChange={e => setFallbackPos(e.target.value)}>
-                <option value="">(none — leave unowned)</option>
-                {byFacility(Object.entries(mappedPositions.reduce((acc, id) => {
-                  const p = posById(id);
-                  const f = p?.facilityId || p?.facility || '?';
-                  (acc[f] = acc[f] || []).push(id);
-                  return acc;
-                }, {} as Record<string, string[]>))).map(([f, ids]) => (
-                  <optgroup key={f} label={f}>
-                    {ids.map(id => <option key={id} value={id}>{posLabel(id)}</option>)}
-                  </optgroup>
-                ))}
-              </select>
-              <span style={{ color: 'var(--fg-secondary)' }}>or</span>
-              <input list="ssg-positions" className="themed" style={{ minWidth: 200 }}
-                value="" placeholder="search any position…"
-                onChange={e => { const id = labelToId.get(e.target.value); if (id) setFallbackPos(id); }} />
+                options={posOptions}
+                onChange={setFallbackPos}
+                placeholder="search any position…"
+                noneLabel="(none — leave unowned)"
+                minWidth={260}
+              />
             </label>
             <div style={{ maxHeight: '55vh', overflowY: 'auto', overflowX: 'hidden', fontSize: 12, border: '1px solid var(--border)', borderRadius: 'var(--radius)', padding: 6 }}>
               {ownersByFacility.map(([fac, keys]) => (
@@ -481,13 +463,13 @@ export function LiveCaptureEdit() {
                         {k.split('/')[1]} <span style={{ color: 'var(--fg-secondary)' }}>({countByOwner.get(k) || 0})</span>
                       </span>
                       <span style={{ color: 'var(--fg-secondary)' }}>→</span>
-                      <input list="ssg-positions" className="themed" style={{ minWidth: 240 }}
-                        value={idToLabel.get(ownerToPosition[k]) ?? ''} placeholder="(use fallback)"
-                        onFocus={e => e.currentTarget.select()}
-                        onChange={e => {
-                          const id = labelToId.get(e.target.value) || '';
-                          setOwnerToPosition(m => ({ ...m, [k]: id }));
-                        }} />
+                      <PositionPicker
+                        value={ownerToPosition[k] || ''}
+                        options={posOptions}
+                        onChange={id => setOwnerToPosition(m => ({ ...m, [k]: id }))}
+                        placeholder="(use fallback)"
+                        noneLabel="(use fallback)"
+                      />
                     </div>
                   ))}
                 </div>
